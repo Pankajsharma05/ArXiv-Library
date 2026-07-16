@@ -2,7 +2,7 @@
 
 # ArXivLibrary
 
-**An arXiv-native desktop research library manager for researchers.**
+**An open-source arXiv-native desktop research library manager for researchers.**
 
 Search, organize, and connect papers — all from a fast native desktop app.
 
