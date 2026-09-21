@@ -25,13 +25,14 @@ async fn s2_throttle() {
 /// exponential backoff (1s, 2s, 4s). Returns the response on success, or a
 /// "rate_limited" error only after the retries are exhausted.
 async fn s2_get(url: &str) -> Result<reqwest::Response, String> {
-    let client = reqwest::Client::new();
+    s2_send(|| crate::http::API.get(url)).await
+}
+
+async fn s2_send(build: impl Fn() -> reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
     let mut backoff = Duration::from_secs(1);
     for attempt in 0..4 {
         s2_throttle().await;
-        let resp = client
-            .get(url)
-            .header("User-Agent", "ArxivLibrary/1.0 (research tool)")
+        let resp = build()
             .send()
             .await
             .map_err(|e| format!("Network error: {e}"))?;
@@ -73,10 +74,53 @@ struct S2Response {
 
 const BASE: &str = "https://api.semanticscholar.org/graph/v1/paper";
 
+fn metrics_from(arxiv_id: &str, data: S2Response) -> PaperMetrics {
+    PaperMetrics {
+        arxiv_id: arxiv_id.to_string(),
+        citation_count: data.citation_count,
+        influential_citation_count: data.influential_citation_count,
+        venue: data.venue.filter(|v| !v.is_empty()),
+        year: data.year,
+        url: data.url,
+    }
+}
+
+/// Maximum ids per Semantic Scholar batch request (API limit is 500).
+const BATCH_MAX: usize = 400;
+
+/// Fetch metrics for many arXiv ids in as few requests as possible. The
+/// batch endpoint answers up to 500 ids per call, versus one id per ~1.1 s
+/// with the single-paper endpoint. Ids S2 doesn't know come back with empty
+/// metrics. Results are in the same order as `arxiv_ids`.
+pub async fn fetch_metrics_batch(arxiv_ids: &[String]) -> Result<Vec<PaperMetrics>, String> {
+    let mut out = Vec::with_capacity(arxiv_ids.len());
+    for chunk in arxiv_ids.chunks(BATCH_MAX) {
+        let ids: Vec<String> = chunk
+            .iter()
+            .map(|id| format!("ARXIV:{}", crate::arxiv::base_id(id)))
+            .collect();
+        let body = serde_json::json!({ "ids": ids });
+        let url = format!("{BASE}/batch?fields=citationCount,influentialCitationCount,venue,year,url");
+        let resp = s2_send(|| crate::http::API.post(&url).json(&body)).await?;
+        if !resp.status().is_success() {
+            return Err(format!("Semantic Scholar returned {}", resp.status()));
+        }
+        let data: Vec<Option<S2Response>> =
+            resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+        for (id, item) in chunk.iter().zip(data.into_iter().chain(std::iter::repeat_with(|| None))) {
+            out.push(match item {
+                Some(d) => metrics_from(id, d),
+                None => PaperMetrics { arxiv_id: id.clone(), ..Default::default() },
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch metrics for one arXiv id (base id, no version suffix).
 pub async fn fetch_metrics(arxiv_id: &str) -> Result<PaperMetrics, String> {
     // Strip a trailing version like v2 so the ARXIV: lookup resolves.
-    let base = arxiv_id.split('v').next().unwrap_or(arxiv_id);
+    let base = crate::arxiv::base_id(arxiv_id);
     let fields = "citationCount,influentialCitationCount,venue,year,url";
     let url = format!("{BASE}/ARXIV:{base}?fields={fields}");
 
@@ -91,14 +135,7 @@ pub async fn fetch_metrics(arxiv_id: &str) -> Result<PaperMetrics, String> {
     }
 
     let data: S2Response = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
-    Ok(PaperMetrics {
-        arxiv_id: arxiv_id.to_string(),
-        citation_count: data.citation_count,
-        influential_citation_count: data.influential_citation_count,
-        venue: data.venue.filter(|v| !v.is_empty()),
-        year: data.year,
-        url: data.url,
-    })
+    Ok(metrics_from(arxiv_id, data))
 }
 
 #[derive(Deserialize)]
@@ -116,7 +153,7 @@ struct ExternalIds {
 /// Resolve the published DOI for an arXiv id, if one exists.
 /// Returns None when the paper has no journal DOI yet (still just a preprint).
 pub async fn resolve_doi(arxiv_id: &str) -> Result<Option<String>, String> {
-    let base = arxiv_id.split('v').next().unwrap_or(arxiv_id);
+    let base = crate::arxiv::base_id(arxiv_id);
     let url = format!("{BASE}/ARXIV:{base}?fields=externalIds");
     let resp = s2_get(&url).await?;
 

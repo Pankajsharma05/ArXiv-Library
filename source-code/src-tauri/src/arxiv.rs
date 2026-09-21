@@ -8,7 +8,6 @@ use tokio::sync::Mutex;
 
 const ENDPOINT: &str = "https://export.arxiv.org/api/query";
 const MIN_INTERVAL: Duration = Duration::from_secs(3);
-const USER_AGENT: &str = "ArxivLibrary/1.0 (cross-platform; personal research tool)";
 
 /// Global throttle: arXiv asks for no more than one request every 3 seconds.
 static LAST_REQUEST: Lazy<Mutex<Option<Instant>>> = Lazy::new(|| Mutex::new(None));
@@ -39,9 +38,86 @@ pub struct Paper {
     pub last_opened: Option<String>,
     #[serde(default)]
     pub trashed: bool,
+    /// Author comments, e.g. "12 pages, 4 figures, accepted in PRL".
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// When the paper was saved to the library (library papers only).
+    #[serde(default)]
+    pub added_at: Option<String>,
 }
 
 fn default_status() -> String { "unread".to_string() }
+
+/// One page of search results plus the total number of matches arXiv reports.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchPage {
+    pub papers: Vec<Paper>,
+    pub total: u64,
+}
+
+/// Strip a trailing version suffix: "2401.01234v3" -> "2401.01234",
+/// "solv-int/9901001v2" -> "solv-int/9901001". Only a final `v<digits>` counts,
+/// so archive names that contain a 'v' are left intact.
+pub fn base_id(id: &str) -> &str {
+    if let Some(pos) = id.rfind('v') {
+        let tail = &id[pos + 1..];
+        if pos > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+            return &id[..pos];
+        }
+    }
+    id
+}
+
+/// Extract an arXiv identifier from free text: a bare id ("2401.01234",
+/// "2401.01234v2", "hep-th/9901001"), an "arXiv:" prefixed id, or an
+/// arxiv.org abs/pdf/html URL. Returns None if the text isn't one of those.
+pub fn parse_id(input: &str) -> Option<String> {
+    let mut s = input.trim();
+    for prefix in ["https://", "http://"] {
+        s = s.strip_prefix(prefix).unwrap_or(s);
+    }
+    s = s.strip_prefix("www.").unwrap_or(s);
+    s = s.strip_prefix("export.").unwrap_or(s);
+    if let Some(rest) = s.strip_prefix("arxiv.org/") {
+        let rest = rest
+            .strip_prefix("abs/")
+            .or_else(|| rest.strip_prefix("pdf/"))
+            .or_else(|| rest.strip_prefix("html/"))?;
+        s = rest.trim_end_matches('/');
+        s = s.strip_suffix(".pdf").unwrap_or(s);
+    } else {
+        let lower = s.to_ascii_lowercase();
+        if lower.starts_with("arxiv:") {
+            s = s[6..].trim();
+        }
+    }
+    let s = s.split(['?', '#']).next().unwrap_or(s);
+    if is_new_style(s) || is_old_style(s) {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// YYMM.NNNN or YYMM.NNNNN, optional vN.
+fn is_new_style(s: &str) -> bool {
+    let core = base_id(s);
+    let Some((yymm, num)) = core.split_once('.') else { return false };
+    yymm.len() == 4
+        && yymm.bytes().all(|b| b.is_ascii_digit())
+        && (4..=5).contains(&num.len())
+        && num.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// archive(.SUB)/YYMMNNN, optional vN.
+fn is_old_style(s: &str) -> bool {
+    let core = base_id(s);
+    let Some((archive, num)) = core.split_once('/') else { return false };
+    !archive.is_empty()
+        && archive.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-' || b == b'.')
+        && num.len() == 7
+        && num.bytes().all(|b| b.is_ascii_digit())
+}
 
 pub async fn throttle() {
     let mut last = LAST_REQUEST.lock().await;
@@ -59,7 +135,7 @@ pub async fn search(
     start: u32,
     max_results: u32,
     sort_by: &str,
-) -> Result<Vec<Paper>, String> {
+) -> Result<SearchPage, String> {
     throttle().await;
     // "submittedDateOldest" is our virtual sort: submittedDate ascending.
     let (sb, order) = if sort_by == "submittedDateOldest" {
@@ -74,22 +150,38 @@ pub async fn search(
     fetch_and_parse(&url).await
 }
 
-#[allow(dead_code)]
+/// Look papers up directly by arXiv id (any version suffix is honoured).
 pub async fn fetch_by_ids(ids: &[String]) -> Result<Vec<Paper>, String> {
     if ids.is_empty() {
         return Ok(vec![]);
     }
     throttle().await;
+    let list: Vec<String> = ids.iter().map(|i| urlencoding(i)).collect();
     let url = format!(
         "{ENDPOINT}?id_list={}&max_results={}",
-        ids.join(","),
+        list.join(","),
         ids.len()
     );
-    fetch_and_parse(&url).await
+    // Unknown ids simply yield no entry; malformed ones can come back as an
+    // "api/errors" pseudo-entry, which we drop.
+    let page = fetch_and_parse(&url).await?;
+    let mut papers: Vec<Paper> = page
+        .papers
+        .into_iter()
+        .filter(|p| !p.title.is_empty() && !p.arxiv_id.contains("api/errors"))
+        .collect();
+    // arXiv doesn't preserve id_list order; return papers in the order asked for.
+    let rank = |p: &Paper| {
+        ids.iter()
+            .position(|i| base_id(i) == base_id(&p.arxiv_id))
+            .unwrap_or(usize::MAX)
+    };
+    papers.sort_by_key(rank);
+    Ok(papers)
 }
 
-async fn fetch_and_parse(url: &str) -> Result<Vec<Paper>, String> {
-    let client = reqwest::Client::new();
+async fn fetch_and_parse(url: &str) -> Result<SearchPage, String> {
+    let client = &*crate::http::API;
     // arXiv's API intermittently returns 503 (load shedding) and 429 (rate limit).
     // Retry a few times with increasing backoff before giving up.
     let mut last_status = 0u16;
@@ -99,11 +191,7 @@ async fn fetch_and_parse(url: &str) -> Result<Vec<Paper>, String> {
             let wait = 1000u64 * (1 << (attempt - 1));
             tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
         }
-        let resp = match client
-            .get(url)
-            .header("User-Agent", USER_AGENT)
-            .send()
-            .await
+        let resp = match client.get(url).send().await
         {
             Ok(r) => r,
             Err(e) => {
@@ -143,7 +231,7 @@ fn urlencoding(s: &str) -> String {
     out
 }
 
-fn parse_atom(xml: &str) -> Result<Vec<Paper>, String> {
+fn parse_atom(xml: &str) -> Result<SearchPage, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -166,6 +254,8 @@ fn parse_atom(xml: &str) -> Result<Vec<Paper>, String> {
     let mut abs_url: Option<String> = None;
     let mut doi: Option<String> = None;
     let mut journal_ref: Option<String> = None;
+    let mut comment = String::new();
+    let mut total: Option<u64> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -182,6 +272,7 @@ fn parse_atom(xml: &str) -> Result<Vec<Paper>, String> {
                         authors.clear(); categories.clear();
                         pdf_url = None; abs_url = None;
                         doi = None; journal_ref = None;
+                        comment.clear();
                     }
                     "author" if in_entry => in_author = true,
                     _ => {}
@@ -219,6 +310,11 @@ fn parse_atom(xml: &str) -> Result<Vec<Paper>, String> {
             }
             Ok(Event::Text(e)) => {
                 if !in_entry {
+                    if current_tag == "totalResults" {
+                        let text = e.unescape().unwrap_or_default();
+                        total = text.trim().parse().ok();
+                    }
+                    buf.clear();
                     continue;
                 }
                 let text = e.unescape().unwrap_or_default().to_string();
@@ -231,6 +327,10 @@ fn parse_atom(xml: &str) -> Result<Vec<Paper>, String> {
                     "name" if in_author => authors.push(text),
                     "doi" => doi = Some(text.trim().to_string()),
                     "journal_ref" => journal_ref = Some(normalize(&text)),
+                    "comment" => {
+                        if !comment.is_empty() { comment.push(' '); }
+                        comment.push_str(&normalize(&text));
+                    }
                     _ => {}
                 }
             }
@@ -274,6 +374,8 @@ fn parse_atom(xml: &str) -> Result<Vec<Paper>, String> {
                             reading_status: "unread".to_string(),
                             last_opened: None,
                             trashed: false,
+                            comment: if comment.is_empty() { None } else { Some(comment.clone()) },
+                            added_at: None,
                         });
                     }
                     _ => {}
@@ -284,7 +386,8 @@ fn parse_atom(xml: &str) -> Result<Vec<Paper>, String> {
         }
         buf.clear();
     }
-    Ok(papers)
+    let total = total.unwrap_or(papers.len() as u64);
+    Ok(SearchPage { papers, total })
 }
 
 fn local_name(qname: &[u8]) -> String {
@@ -316,5 +419,59 @@ fn normalize_date(s: &str) -> String {
     match s.parse::<DateTime<Utc>>() {
         Ok(d) => d.to_rfc3339(),
         Err(_) => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_id_strips_only_trailing_version() {
+        assert_eq!(base_id("2401.01234v3"), "2401.01234");
+        assert_eq!(base_id("2401.01234"), "2401.01234");
+        assert_eq!(base_id("solv-int/9901001v2"), "solv-int/9901001");
+        assert_eq!(base_id("solv-int/9901001"), "solv-int/9901001");
+    }
+
+    #[test]
+    fn parse_id_accepts_ids_and_urls() {
+        assert_eq!(parse_id("2401.01234").as_deref(), Some("2401.01234"));
+        assert_eq!(parse_id(" arXiv:2401.01234v2 ").as_deref(), Some("2401.01234v2"));
+        assert_eq!(parse_id("https://arxiv.org/abs/2401.01234v2").as_deref(), Some("2401.01234v2"));
+        assert_eq!(parse_id("https://arxiv.org/pdf/2401.01234.pdf").as_deref(), Some("2401.01234"));
+        assert_eq!(parse_id("arxiv.org/abs/hep-th/9901001").as_deref(), Some("hep-th/9901001"));
+        assert_eq!(parse_id("math.AG/0601001").as_deref(), Some("math.AG/0601001"));
+        assert_eq!(parse_id("majorana zero modes"), None);
+        assert_eq!(parse_id("2401"), None);
+    }
+
+    #[test]
+    fn parses_total_and_comment() {
+        let xml = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>arXiv Query</title>
+  <opensearch:totalResults>11004</opensearch:totalResults>
+  <entry>
+    <id>http://arxiv.org/abs/2401.01234v2</id>
+    <updated>2024-01-05T00:00:00Z</updated>
+    <published>2024-01-02T00:00:00Z</published>
+    <title>A  Title</title>
+    <summary>Abstract.</summary>
+    <author><name>A. Author</name></author>
+    <arxiv:comment>5 pages, 2 figures</arxiv:comment>
+    <link title="pdf" href="http://arxiv.org/pdf/2401.01234v2" rel="related"/>
+    <arxiv:primary_category term="quant-ph"/>
+    <category term="quant-ph"/>
+  </entry>
+</feed>"#;
+        let page = parse_atom(xml).unwrap();
+        assert_eq!(page.total, 11004);
+        assert_eq!(page.papers.len(), 1);
+        let p = &page.papers[0];
+        assert_eq!(p.arxiv_id, "2401.01234v2");
+        assert_eq!(p.title, "A Title");
+        assert_eq!(p.comment.as_deref(), Some("5 pages, 2 figures"));
+        assert_eq!(p.authors, vec!["A. Author".to_string()]);
     }
 }

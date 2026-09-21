@@ -995,3 +995,45 @@ body {
 .bib-card.bib-selected { outline: 2px solid var(--accent-soft); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .bib-card .bib-folder-tags { margin-top: 5px; display:flex; gap:5px; flex-wrap:wrap; }
 .bib-mini-tag { font-size: 10.5px; padding: 1px 7px; border-radius: 9px; background: var(--bg-elev2); color: var(--text-dim); }
+
+/* ---------- Toast action (Undo) ---------- */
+#toast { display: flex; align-items: center; gap: 14px; }
+.toast-action {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--accent-soft); font-weight: 600; font-size: 13px;
+}
+.toast-action:hover { text-decoration: underline; }
+
+/* ---------- Detail pane extras ---------- */
+.detail-comment {
+  font-size: 12.5px; color: var(--text-dim); font-style: italic;
+  margin: -2px 0 8px;
+}
+.detail-dates { font-size: 12px; color: var(--text-dim); margin: 0 0 8px; }
+
+/* ---------- Feed "new since last visit" ---------- */
+.new-badge {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  color: #fff; background: var(--accent); border-radius: 4px;
+  padding: 1px 6px; margin-left: auto;
+}
+.new-badge + .save-btn, .new-badge + .saved-tag { margin-left: 8px; }
+
+/* ---------- Inline code / keys in empty states and tips ---------- */
+.empty-list code, .onboard-feature code {
+  font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.92em;
+  background: var(--bg-elev2); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px;
+}
+.empty-list kbd, .onboard-feature kbd {
+  font-family: inherit; font-size: 0.9em; border: 1px solid var(--border);
+  border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; background: var(--bg-elev);
+}
+
+/* ---------- Search bar layout ----------
+   The query box gets a full row; sort / Search / Advanced sit on the row below.
+   Previously all four shared one row and the query box was crushed to ~40px
+   at the default list-pane width. */
+#search-bar { flex-wrap: wrap; }
+#search-bar > .search-input-wrap { flex: 1 1 100%; }
+#search-bar #quick-sort { flex: 1 1 auto; min-height: 32px; }
+#search-bar #adv-toggle, #search-bar #search-btn { white-space: nowrap; }

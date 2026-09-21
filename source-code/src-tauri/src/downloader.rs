@@ -1,10 +1,9 @@
 use crate::arxiv::Paper;
 use crate::db::data_dir;
 use futures_util::StreamExt;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
-
-const USER_AGENT: &str = "ArxivLibrary/1.0 (cross-platform; personal research tool)";
 
 fn pdf_dir() -> PathBuf {
     let dir = data_dir().join("PDFs");
@@ -21,18 +20,31 @@ struct DownloadProgress {
     done: bool,
 }
 
+/// True if the file at `path` starts with the PDF magic bytes. Used both to
+/// validate a fresh download and to reject a stale/corrupt cached file.
+fn looks_like_pdf(path: &Path) -> bool {
+    let mut head = [0u8; 5];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .map(|_| &head == b"%PDF-")
+        .unwrap_or(false)
+}
+
 /// Streams a PDF from `url` to `dest`, emitting "download-progress" events on
 /// `app` (if provided) tagged with `arxiv_id`. Returns the saved path.
+///
+/// Bytes go to a sibling `.part` file which is only renamed into place once the
+/// transfer completes and the content is verified to be a PDF. A dropped
+/// connection or an HTML error page therefore never ends up cached as the
+/// paper's PDF.
 async fn stream_to_file(
     url: &str,
-    dest: &PathBuf,
+    dest: &Path,
     arxiv_id: &str,
     app: Option<&AppHandle>,
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = crate::http::DOWNLOAD
         .get(url)
-        .header("User-Agent", USER_AGENT)
         .send()
         .await
         .map_err(|e| format!("Download error: {e}"))?;
@@ -42,50 +54,66 @@ async fn stream_to_file(
 
     let total = resp.content_length().unwrap_or(0);
     let mut received: u64 = 0;
-    let mut buf: Vec<u8> = Vec::with_capacity(total.max(1024) as usize);
     let mut stream = resp.bytes_stream();
 
-    // Throttle progress emissions so we don't flood the IPC bridge: emit at most
-    // every ~64KB or whenever a chunk arrives, whichever is coarser.
-    let mut last_emit: u64 = 0;
-    let emit = |arxiv_id: &str, received: u64, total: u64, done: bool| {
+    let part = dest.with_extension("pdf.part");
+    let mut file = std::fs::File::create(&part).map_err(|e| format!("Write error: {e}"))?;
+
+    let emit = |received: u64, total: u64, done: bool| {
         if let Some(app) = app {
             let _ = app.emit(
                 "download-progress",
-                DownloadProgress {
-                    arxiv_id: arxiv_id.to_string(),
-                    received,
-                    total,
-                    done,
-                },
+                DownloadProgress { arxiv_id: arxiv_id.to_string(), received, total, done },
             );
         }
     };
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Read error: {e}"))?;
-        received += chunk.len() as u64;
-        buf.extend_from_slice(&chunk);
-        if received - last_emit >= 65_536 {
-            last_emit = received;
-            emit(arxiv_id, received, total, false);
+    // Throttle progress emissions so we don't flood the IPC bridge.
+    let mut last_emit: u64 = 0;
+    let result: Result<(), String> = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Read error: {e}"))?;
+            received += chunk.len() as u64;
+            file.write_all(&chunk).map_err(|e| format!("Write error: {e}"))?;
+            if received - last_emit >= 65_536 {
+                last_emit = received;
+                emit(received, total, false);
+            }
         }
+        file.flush().map_err(|e| format!("Write error: {e}"))?;
+        Ok(())
     }
+    .await;
+    drop(file);
 
-    std::fs::write(dest, &buf).map_err(|e| format!("Write error: {e}"))?;
-    emit(arxiv_id, received, total.max(received), true);
+    if let Err(e) = result {
+        std::fs::remove_file(&part).ok();
+        return Err(e);
+    }
+    if !looks_like_pdf(&part) {
+        std::fs::remove_file(&part).ok();
+        return Err("arXiv did not return a PDF (it may still be generating it). Try again shortly.".into());
+    }
+    std::fs::rename(&part, dest).map_err(|e| format!("Write error: {e}"))?;
+    emit(received, total.max(received), true);
     Ok(dest.to_string_lossy().to_string())
+}
+
+/// Reuse `dest` if it holds a valid PDF; otherwise (re)download it.
+async fn cached_or_download(paper: &Paper, dest: PathBuf, app: Option<&AppHandle>) -> Result<String, String> {
+    if dest.exists() {
+        if looks_like_pdf(&dest) {
+            return Ok(dest.to_string_lossy().to_string());
+        }
+        std::fs::remove_file(&dest).ok();
+    }
+    stream_to_file(&paper.pdf_url, &dest, &paper.arxiv_id, app).await
 }
 
 /// Downloads the paper's PDF and returns the absolute path as a string.
 pub async fn download(paper: &Paper, app: Option<&AppHandle>) -> Result<String, String> {
     let filename = format!("{}.pdf", paper.arxiv_id.replace('/', "_"));
-    let dest = pdf_dir().join(&filename);
-
-    if dest.exists() {
-        return Ok(dest.to_string_lossy().to_string());
-    }
-    stream_to_file(&paper.pdf_url, &dest, &paper.arxiv_id, app).await
+    cached_or_download(paper, pdf_dir().join(filename), app).await
 }
 
 pub fn delete(path: &str) {
@@ -96,10 +124,5 @@ pub fn delete(path: &str) {
 /// Used for "view without saving to library" — the file is a throwaway.
 pub async fn download_to_temp(paper: &Paper, app: Option<&AppHandle>) -> Result<String, String> {
     let filename = format!("arxiv_{}.pdf", paper.arxiv_id.replace('/', "_"));
-    let dest = std::env::temp_dir().join(&filename);
-
-    if dest.exists() {
-        return Ok(dest.to_string_lossy().to_string());
-    }
-    stream_to_file(&paper.pdf_url, &dest, &paper.arxiv_id, app).await
+    cached_or_download(paper, std::env::temp_dir().join(filename), app).await
 }

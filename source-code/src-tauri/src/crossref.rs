@@ -71,7 +71,9 @@ fn clean_doi(input: &str) -> String {
     let s = input.trim();
     let s = s.strip_prefix("https://doi.org/").unwrap_or(s);
     let s = s.strip_prefix("http://doi.org/").unwrap_or(s);
-    let s = s.strip_prefix("doi:").unwrap_or(s);
+    let s = s.strip_prefix("https://dx.doi.org/").unwrap_or(s);
+    let s = s.strip_prefix("http://dx.doi.org/").unwrap_or(s);
+    let s = s.strip_prefix("doi:").or_else(|| s.strip_prefix("DOI:")).unwrap_or(s);
     s.trim().to_string()
 }
 
@@ -81,12 +83,10 @@ pub async fn fetch_citation(doi_input: &str) -> Result<Citation, String> {
         return Err("Empty DOI".to_string());
     }
     let url = format!("https://api.crossref.org/works/{doi}");
-    let client = reqwest::Client::new();
-    let resp = client
+    // The shared client's User-Agent carries the project URL, which is what
+    // Crossref's "polite pool" asks for.
+    let resp = crate::http::API
         .get(&url)
-        // Crossref's "polite pool" requests a contact. Replace with your email
-        // or GitHub URL before distributing.
-        .header("User-Agent", "ArxivLibrary/1.0 (https://github.com)")
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;

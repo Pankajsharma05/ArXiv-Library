@@ -1,0 +1,3 @@
+# Rust / Tauri build output
+source-code/src-tauri/target/
+source-code/src-tauri/gen/

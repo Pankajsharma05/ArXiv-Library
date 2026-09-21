@@ -27,14 +27,18 @@ little smoother. It's shared freely in the hope that others find it useful.
 
 ### Features
 
-- **arXiv search** — full-text and advanced fielded search, pagination, search history, and Cmd+K quick search
+- **arXiv search** — full-text and advanced fielded search, result counts, infinite scroll, search history, and Cmd+K quick search
+- **Paste a link** — drop an arXiv id or URL into search to jump straight to that paper
 - **Library** — save papers into nested, color-coded collections; tags, reading status, and markdown notes
-- **Daily Feed** — new papers from the arXiv categories you follow
+- **Daily Feed** — new papers from the arXiv categories you follow, with "NEW" badges since your last visit
 - **Graph view** — force-directed graph connecting related papers
 - **Bibliography** — DOI lookup via Crossref; import/export `.bib` and `.ris`
 - **Citations & venues** — enriched via Semantic Scholar
 - **Custom themes** — full palette engine from base + accent colors
-- **PDF handling** — download and open in your system PDF viewer
+- **PDF handling** — download (verified to be a real PDF before saving) and open in your system PDF viewer
+- **Keyboard-first** — `/` search, `J`/`K` navigate, `S` save, `O` open PDF, undo for trash; ⌘/ lists every shortcut
+
+See [CHANGELOG.md](CHANGELOG.md) for what's new.
 
 ---
 

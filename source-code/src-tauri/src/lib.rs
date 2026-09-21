@@ -5,10 +5,11 @@ mod arxiv;
 mod crossref;
 mod db;
 mod downloader;
+mod http;
 mod semantic;
 mod settings;
 
-use arxiv::Paper;
+use arxiv::{Paper, SearchPage};
 use db::{Backup, Collection, Db, Edge, Tag, HistoryEntry, BibEntry, BibFolder, BibTag};
 use settings::{Settings, SettingsStore, SavedSearch};
 use serde::Serialize;
@@ -35,8 +36,32 @@ async fn search_arxiv(
     sort_by: String,
     max_results: Option<u32>,
     start: Option<u32>,
-) -> Result<Vec<Paper>, String> {
-    arxiv::search(&query, start.unwrap_or(0), max_results.unwrap_or(40), &sort_by).await
+) -> Result<SearchPage, String> {
+    // arXiv rejects very large pages; keep requests within its documented limits.
+    let max = max_results.unwrap_or(40).clamp(1, 500);
+    arxiv::search(&query, start.unwrap_or(0), max, &sort_by).await
+}
+
+/// If `input` is one or more arXiv ids / arxiv.org URLs (separated by spaces,
+/// commas or newlines), fetch exactly those papers. Returns None when the input
+/// is an ordinary search query, so the caller can fall back to a normal search.
+#[tauri::command]
+async fn lookup_arxiv_ids(input: String) -> Result<Option<Vec<Paper>>, String> {
+    let tokens: Vec<&str> = input
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = Vec::new();
+    for t in tokens {
+        match arxiv::parse_id(t) {
+            Some(id) => { if !ids.contains(&id) { ids.push(id) } }
+            None => return Ok(None),
+        }
+    }
+    arxiv::fetch_by_ids(&ids).await.map(Some)
 }
 
 #[tauri::command]
@@ -63,6 +88,46 @@ fn save_paper(state: State<AppState>, paper: Paper, collection_id: Option<String
         state.db.assign(&paper.arxiv_id, &cid)?;
     }
     Ok(())
+}
+
+/// Save many papers at once (optionally into a collection). Papers already in
+/// the trash are restored.
+#[tauri::command]
+fn save_papers(state: State<AppState>, papers: Vec<Paper>, collection_id: Option<String>) -> Result<(), String> {
+    state.db.save_papers(&papers, collection_id.as_deref())
+}
+
+#[tauri::command]
+fn bulk_set_trashed(state: State<AppState>, ids: Vec<String>, trashed: bool) -> Result<(), String> {
+    state.db.bulk_set_trashed(&ids, trashed)
+}
+
+#[tauri::command]
+fn bulk_set_reading_status(state: State<AppState>, ids: Vec<String>, status: String) -> Result<(), String> {
+    state.db.bulk_set_reading_status(&ids, &status)
+}
+
+#[tauri::command]
+fn bulk_assign(state: State<AppState>, ids: Vec<String>, collection_id: String) -> Result<(), String> {
+    state.db.bulk_assign(&ids, &collection_id)
+}
+
+#[tauri::command]
+fn bulk_unassign(state: State<AppState>, ids: Vec<String>, collection_id: String) -> Result<(), String> {
+    state.db.bulk_unassign(&ids, &collection_id)
+}
+
+#[tauri::command]
+fn bulk_tag(state: State<AppState>, ids: Vec<String>, tag_id: String) -> Result<(), String> {
+    state.db.bulk_tag(&ids, &tag_id)
+}
+
+/// Permanently delete papers and their downloaded PDFs.
+#[tauri::command]
+fn bulk_delete_papers(state: State<AppState>, ids: Vec<String>) -> Result<u32, String> {
+    let paths = state.db.bulk_delete_papers(&ids)?;
+    for p in &paths { downloader::delete(p); }
+    Ok(ids.len() as u32)
 }
 
 #[tauri::command]
@@ -234,14 +299,21 @@ fn export_settings(state: State<AppState>) -> Result<String, String> {
 
 #[tauri::command]
 fn import_settings(state: State<AppState>, json: String) -> Result<(), String> {
-    let s: Settings = serde_json::from_str(&json).map_err(|e| format!("Invalid settings file: {e}"))?;
-    state.settings.import_from(&s);
+    let raw: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("Invalid settings file: {e}"))?;
+    let s: Settings = serde_json::from_value(raw.clone()).map_err(|e| format!("Invalid settings file: {e}"))?;
+    state.settings.import_from(&s, &raw);
     Ok(())
 }
 
 #[tauri::command]
 async fn fetch_paper_metrics(arxiv_id: String) -> Result<semantic::PaperMetrics, String> {
     semantic::fetch_metrics(&arxiv_id).await
+}
+
+/// Citation metrics for many papers in one Semantic Scholar batch request.
+#[tauri::command]
+async fn fetch_metrics_batch(arxiv_ids: Vec<String>) -> Result<Vec<semantic::PaperMetrics>, String> {
+    semantic::fetch_metrics_batch(&arxiv_ids).await
 }
 
 // ---- View history ----
@@ -515,8 +587,17 @@ pub fn run() {
         .manage(AppState { db, settings })
         .invoke_handler(tauri::generate_handler![
             search_arxiv,
+            lookup_arxiv_ids,
             get_library,
             save_paper,
+            save_papers,
+            bulk_set_trashed,
+            bulk_set_reading_status,
+            bulk_assign,
+            bulk_unassign,
+            bulk_tag,
+            bulk_delete_papers,
+            fetch_metrics_batch,
             delete_paper,
             update_note,
             download_pdf,
@@ -586,4 +667,62 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Network smoke tests for the API clients. They hit the real services, so they
+/// are ignored by default: `cargo test -- --ignored --test-threads=1`.
+#[cfg(test)]
+mod live_tests {
+    #[tokio::test]
+    #[ignore]
+    async fn search_reports_total_and_pages() {
+        let page = crate::arxiv::search("all:majorana", 0, 5, "relevance").await.unwrap();
+        assert_eq!(page.papers.len(), 5);
+        assert!(page.total > 1000, "total = {}", page.total);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn lookup_by_id_and_url() {
+        let found = super::lookup_arxiv_ids("https://arxiv.org/abs/1706.03762v5, hep-th/9711200".into())
+            .await.unwrap().expect("ids recognised");
+        let ids: Vec<_> = found.iter().map(|p| p.arxiv_id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(found[0].title.contains("Attention"));
+        assert!(super::lookup_arxiv_ids("attention is all you need".into()).await.unwrap().is_none());
+        let none = super::lookup_arxiv_ids("2401.99999".into()).await.unwrap().unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn metrics_batch_aligns_with_input() {
+        let ids = vec!["1706.03762v5".to_string(), "2401.99999".to_string(), "hep-th/9711200".to_string()];
+        let m = crate::semantic::fetch_metrics_batch(&ids).await.unwrap();
+        assert_eq!(m.len(), 3);
+        assert!(m[0].citation_count.unwrap_or(0) > 1000);
+        assert!(m[1].citation_count.is_none());
+        assert!(m[2].citation_count.unwrap_or(0) > 1000);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn download_validates_and_caches_pdf() {
+        let mut p = crate::arxiv::fetch_by_ids(&["1706.03762v5".into()]).await.unwrap().remove(0);
+        let path = crate::downloader::download_to_temp(&p, None).await.unwrap();
+        let head = std::fs::read(&path).unwrap();
+        assert!(head.starts_with(b"%PDF-"));
+        assert!(!std::path::Path::new(&format!("{path}.part")).exists());
+
+        // A corrupt cached file is replaced rather than served forever.
+        std::fs::write(&path, b"<html>not a pdf</html>").unwrap();
+        let again = crate::downloader::download_to_temp(&p, None).await.unwrap();
+        assert!(std::fs::read(&again).unwrap().starts_with(b"%PDF-"));
+
+        // An HTML page instead of a PDF is rejected, and nothing is cached.
+        p.arxiv_id = "not-a-pdf".into();
+        p.pdf_url = "https://arxiv.org/abs/1706.03762".into();
+        assert!(crate::downloader::download_to_temp(&p, None).await.is_err());
+        assert!(!std::env::temp_dir().join("arxiv_not-a-pdf.pdf").exists());
+    }
 }

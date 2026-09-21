@@ -132,12 +132,59 @@ const el = (tag, cls, html) => {
 const esc = (s) =>
   (s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-function toast(msg) {
+// toast("msg") or toast("msg", { label: "Undo", run: async () => … }).
+// An action keeps the toast up longer so there's time to click it.
+function toast(msg, action) {
   const t = $("#toast");
   t.textContent = msg;
+  if (action) {
+    const b = el("button", "toast-action", esc(action.label));
+    b.onclick = async () => {
+      t.classList.add("hidden");
+      try { await action.run(); } catch (err) { toast(String(err)); }
+    };
+    t.append(b);
+  }
   t.classList.remove("hidden");
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => t.classList.add("hidden"), 2400);
+  toast._t = setTimeout(() => t.classList.add("hidden"), action ? 6000 : 2400);
+}
+
+// Move papers to (or back out of) the trash in one call, with an Undo toast.
+async function trashPapers(ids) {
+  if (!ids.length) return;
+  await invoke("bulk_set_trashed", { ids, trashed: true });
+  state.selectedIds.clear();
+  if (state.selectedPaper && ids.includes(state.selectedPaper.arxiv_id)) clearDetail();
+  await loadLibrary();
+  toast(ids.length > 1 ? `${ids.length} moved to Trash` : "Moved to Trash", {
+    label: "Undo",
+    run: async () => {
+      await invoke("bulk_set_trashed", { ids, trashed: false });
+      await loadLibrary();
+      toast("Restored");
+    },
+  });
+}
+async function restorePapers(ids) {
+  if (!ids.length) return;
+  await invoke("bulk_set_trashed", { ids, trashed: false });
+  state.selectedIds.clear();
+  await loadLibrary();
+  toast(ids.length > 1 ? `${ids.length} restored` : "Restored");
+}
+async function deletePapersForever(ids) {
+  if (!ids.length) return false;
+  const ok = await window.__TAURI__.dialog.confirm(
+    ids.length > 1 ? `Permanently delete ${ids.length} papers? This cannot be undone.`
+                   : "Permanently delete this paper? This cannot be undone.",
+    { title: "Delete permanently", kind: "warning" });
+  if (!ok) return false;
+  await invoke("bulk_delete_papers", { ids });
+  state.selectedIds.clear();
+  if (state.selectedPaper && ids.includes(state.selectedPaper.arxiv_id)) clearDetail();
+  await loadLibrary();
+  return true;
 }
 
 function fmtDate(iso) {
@@ -493,6 +540,14 @@ function collectionMenu(e, c) {
     { label: "Share by email", action: () => shareByEmail(state.papers.filter((p) => state.membership[p.arxiv_id]?.has(c.id)), c.name) },
     { sep: true },
     { label: "Delete", danger: true, action: async () => {
+        const kids = state.collections.filter((x) => x.parent_id === c.id).length;
+        const n = state.papers.filter((p) => state.membership[p.arxiv_id]?.has(c.id)).length;
+        if (kids || n) {
+          const ok = await window.__TAURI__.dialog.confirm(
+            `Delete "${c.name}"${kids ? " and its subfolders" : ""}? The ${n} paper${n === 1 ? "" : "s"} in it stay in your library.`,
+            { title: "Delete collection", kind: "warning" });
+          if (!ok) return;
+        }
         await invoke("delete_collection", { id: c.id });
         if (state.view.type === "collection" && state.view.id === c.id)
           selectView({ type: "smart", smart: "all" });
@@ -728,15 +783,18 @@ function currentPapers() {
   if (state.libStatus) {
     papers = papers.filter((p) => (p.reading_status || "unread") === state.libStatus);
   }
-  // Text filter (title, authors, note, category)
-  const f = state.libFilter.trim().toLowerCase();
-  if (f) {
+  // Text filter: every word must appear somewhere in the title, authors,
+  // abstract, notes, categories, id, comments or tag names. "#tag" matches tags only.
+  const words = state.libFilter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length) {
+    const tagName = Object.fromEntries(state.tags.map((t) => [t.id, t.name.toLowerCase()]));
     papers = papers.filter((p) => {
-      return p.title.toLowerCase().includes(f)
-        || p.authors.join(" ").toLowerCase().includes(f)
-        || (p.note || "").toLowerCase().includes(f)
-        || p.categories.join(" ").toLowerCase().includes(f)
-        || p.arxiv_id.toLowerCase().includes(f);
+      const tags = [...(state.paperTags[p.arxiv_id] || [])].map((id) => tagName[id] || "");
+      const hay = [p.title, p.authors.join(" "), p.summary, p.note || "", p.categories.join(" "),
+        p.arxiv_id, p.comment || "", p.journal_ref || ""].join("\n").toLowerCase();
+      return words.every((w) => w.startsWith("#") && w.length > 1
+        ? tags.some((t) => t.includes(w.slice(1)))
+        : hay.includes(w) || tags.some((t) => t.includes(w)));
     });
   }
   // Sort
@@ -746,6 +804,10 @@ function currentPapers() {
     if (s === "author") return (a.authors[0] || "").localeCompare(b.authors[0] || "");
     if (s === "published") return new Date(b.published) - new Date(a.published);
     if (s === "opened") return new Date(b.last_opened || 0) - new Date(a.last_opened || 0);
+    if (s === "citations") {
+      const c = (p) => state.metricsCache[baseId(p.arxiv_id)]?.citation_count ?? -1;
+      return c(b) - c(a);
+    }
     return 0; // "added" — already in added-desc order from backend
   });
   return papers;
@@ -986,12 +1048,23 @@ function renderList() {
   const searching = isSearch || isFeed || isSavedView; // all show save-buttons, hide library controls
   const papers = currentPapers();
   // Title with a greyish count beside it.
-  const countText = papers.length ? ` <span class="title-count">${papers.length}${(isSearch || isSavedView) && !searchPaging.done ? "+" : ""}</span>` : "";
+  let countText = "";
+  if (papers.length) {
+    const total = isSearch ? searchPaging.total : (isSavedView ? savedPaging.total : null);
+    countText = total && total > papers.length
+      ? ` <span class="title-count">${papers.length.toLocaleString()} of ${total.toLocaleString()}</span>`
+      : ` <span class="title-count">${papers.length.toLocaleString()}</span>`;
+  }
   $("#list-title").innerHTML = esc(listTitle()) + countText;
   renderListActions();
   $("#library-controls").classList.toggle("hidden", searching);
 
   const list = $("#paper-list");
+  // Re-rendering the same view (after a save, tag, status change…) keeps the
+  // scroll position; switching to a different view starts at the top.
+  const viewKey = JSON.stringify(state.view);
+  const keepScroll = list.dataset.viewKey === viewKey ? list.scrollTop : 0;
+  list.dataset.viewKey = viewKey;
   list.className = "paper-list" + (state.density === "compact" ? " compact" : "");
   list.innerHTML = "";
   wirePaperListDelegation(list);
@@ -1001,7 +1074,8 @@ function renderList() {
 
   if (!papers.length) {
     let msg;
-    if (isSearch) msg = "Enter a query above. Use Advanced for fields, subject, and dates.";
+    if (isSearch) msg = `Search arXiv above, or paste an arXiv id / link (e.g. <code>2401.01234</code>) to jump straight to that paper.<br><br>
+      Use <code>"quotes"</code> for exact phrases and Advanced for fields, subjects and dates. Press <kbd>/</kbd> to focus the search box.`;
     else if (isFeed) msg = state.feedCategories.length
       ? "Loading the latest papers… or hit Refresh."
       : "Add a category above (e.g. cond-mat.supr-con) to see the newest papers each day.";
@@ -1023,9 +1097,12 @@ function renderList() {
     const authors = p.authors.slice(0, 4).join(", ") + (p.authors.length > 4 ? " et al." : "");
     let action = "";
     if (searching) {
-      action = isSaved(p.arxiv_id)
+      action = isInLibrary(p.arxiv_id)
         ? `<span class="saved-tag">&#10003; Saved</span>`
-        : `<button class="save-btn">+ Save</button>`;
+        : isTrashed(p.arxiv_id)
+          ? `<button class="save-btn" title="This paper is in the Trash — click to restore it">↺ Restore</button>`
+          : `<button class="save-btn">+ Save</button>`;
+      if (isFeed && isNewInFeed(p)) action = `<span class="new-badge" title="New since your last visit">NEW</span>` + action;
     } else {
       action = statusBadge(p);
     }
@@ -1035,8 +1112,8 @@ function renderList() {
           const t = state.tags.find((x) => x.id === tid);
           return t ? `<span class="paper-tag-chip">#${esc(t.name)}</span>` : "";
         }).join("")}</div>` : "";
-    const dates = !searching
-      ? `<div class="card-dates">Added ${fmtDate(p.published)}${p.last_opened ? ` · Opened ${fmtDate(p.last_opened)}` : ""}</div>`
+    const dates = !searching && (p.added_at || p.last_opened)
+      ? `<div class="card-dates">${p.added_at ? `Added ${fmtDate(p.added_at)}` : ""}${p.added_at && p.last_opened ? " · " : ""}${p.last_opened ? `Opened ${fmtDate(p.last_opened)}` : ""}</div>`
       : "";
     // Clickable author links (first few)
     const authorList = p.authors.slice(0, 4).map((a) =>
@@ -1063,6 +1140,7 @@ function renderList() {
   }
   // Single reflow: append the whole fragment at once.
   list.appendChild(frag);
+  list.scrollTop = keepScroll;
   // Kick off lazy metric loads after the cards are in the DOM.
   for (const [target, id] of metricTargets) loadMetricsInto(target, id);
 }
@@ -1070,19 +1148,19 @@ function renderList() {
 let dragPapers = [];
 
 async function ensureSaved(ids) {
-  // Save any dragged papers not yet in the library (from search results).
-  for (const id of ids) {
-    if (!isSaved(id)) {
-      const p = dragPapers.find((x) => x.arxiv_id === id) || resolvePaper(id);
-      if (p) await invoke("save_paper", { paper: p, collectionId: null });
-    }
-  }
+  // Save any dragged papers not yet in the library (from search results), and
+  // bring back any that are sitting in the trash.
+  const papers = ids
+    .filter((id) => !isInLibrary(id))
+    .map((id) => dragPapers.find((x) => x.arxiv_id === id) || resolvePaper(id))
+    .filter(Boolean);
+  if (papers.length) await invoke("save_papers", { papers, collectionId: null });
 }
 async function handleDropToCollection(cid, cname) {
   const ids = dragPapers.map((p) => p.arxiv_id);
   if (!ids.length) return;
   await ensureSaved(ids);
-  for (const id of ids) await invoke("assign_paper", { paperId: id, collectionId: cid });
+  await invoke("bulk_assign", { ids, collectionId: cid });
   dragPapers = []; state.selectedIds.clear();
   await loadLibrary();
   toast(`Added ${ids.length} to ${cname}`);
@@ -1091,7 +1169,7 @@ async function handleDropToTag(tid, tname) {
   const ids = dragPapers.map((p) => p.arxiv_id);
   if (!ids.length) return;
   await ensureSaved(ids);
-  for (const id of ids) await invoke("tag_paper", { paperId: id, tagId: tid });
+  await invoke("bulk_tag", { ids, tagId: tid });
   dragPapers = []; state.selectedIds.clear();
   await loadLibrary();
   toast(`Tagged ${ids.length} with #${tname}`);
@@ -1193,6 +1271,9 @@ function openSavedSearchModal(existing) {
   modal.classList.remove("hidden");
   $("#ss-title").focus();
   $("#ss-cancel").onclick = () => modal.classList.add("hidden");
+  for (const inp of ["#ss-title", "#ss-keywords"]) {
+    $(inp).onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); $("#ss-ok").click(); } };
+  }
   $("#ss-ok").onclick = async () => {
     const title = $("#ss-title").value.trim();
     const keywords = $("#ss-keywords").value.trim();
@@ -1235,7 +1316,7 @@ async function loadSavedSearch(id) {
   // Use cache if present.
   if (state.savedSearchCache[id]) {
     state.savedResults = state.savedSearchCache[id].results;
-    searchPaging = state.savedSearchCache[id].paging;
+    savedPaging = state.savedSearchCache[id].paging;
     renderList();
     return;
   }
@@ -1243,10 +1324,12 @@ async function loadSavedSearch(id) {
   $("#list-title").textContent = s.title;
   const q = savedSearchQuery(s);
   try {
-    const res = await invoke("search_arxiv", { query: q, sortBy: s.sort, maxResults: 50, start: 0 });
+    const { papers: res, total } = await invoke("search_arxiv", { query: q, sortBy: s.sort, maxResults: 50, start: 0 });
+    // The user may have clicked elsewhere while arXiv was answering.
+    if (state.view.type !== "saved" || state.view.id !== id) return;
     state.savedResults = res;
-    searchPaging = { query: q, sort: s.sort, start: res.length, pageSize: 50, done: res.length < 50, loading: false, savedId: id };
-    state.savedSearchCache[id] = { results: res, paging: { ...searchPaging } };
+    savedPaging = { query: q, sort: s.sort, start: res.length, pageSize: 50, total, done: res.length < 50 || res.length >= total, loading: false, savedId: id };
+    state.savedSearchCache[id] = { results: res, paging: savedPaging };
     renderList();
   } catch (err) {
     list.innerHTML = `<div class="empty-list"><div class="empty-icon">&#9888;</div><p>${esc(String(err))}</p>
@@ -1286,6 +1369,21 @@ function renderFeedControls() {
   }
 }
 
+// "NEW" badges: papers submitted after the newest one seen on the previous
+// visit. The threshold is read once per session so badges don't vanish on refresh.
+let feedThreshold = null;
+try { feedThreshold = localStorage.getItem("feedLastSeen"); } catch {}
+function isNewInFeed(p) {
+  return !!feedThreshold && p.published > feedThreshold;
+}
+function rememberFeedSeen(papers) {
+  const newest = papers.reduce((m, p) => (p.published > m ? p.published : m), "");
+  if (!newest) return;
+  try {
+    if (newest > (localStorage.getItem("feedLastSeen") || "")) localStorage.setItem("feedLastSeen", newest);
+  } catch {}
+}
+
 async function loadFeed() {
   if (!state.feedCategories.length) { state.feedResults = []; state.feedLoaded = true; renderList(); return; }
   const list = $("#paper-list");
@@ -1293,10 +1391,11 @@ async function loadFeed() {
   // Build an OR query across followed categories, sorted by newest submission.
   const q = state.feedCategories.map((c) => `cat:${c}`).join(" OR ");
   try {
-    const res = await invoke("search_arxiv", { query: q, sortBy: "submittedDate", maxResults: 60, start: 0 });
+    const { papers: res } = await invoke("search_arxiv", { query: q, sortBy: "submittedDate", maxResults: 60, start: 0 });
     state.feedResults = res;
     state.feedLoaded = true;
-    renderList();
+    rememberFeedSeen(res);
+    if (state.view.type === "feed") renderList();
   } catch (err) {
     state.feedLoaded = false;
     list.innerHTML = `<div class="empty-list"><div class="empty-icon">&#9888;</div>
@@ -1342,16 +1441,22 @@ async function loadHistory() {
           <span class="date">${h.published ? fmtDate(h.published) : ""}</span></div>
         <div class="history-time">Viewed ${fmtDateTime(h.viewed_at)}</div>
       </div>`;
-      card.onclick = () => {
+      card.onclick = async () => {
         const existing = state.papers.find((x) => x.arxiv_id === h.arxiv_id);
-        if (existing) { selectView({ type: "smart", smart: "all" }); selectPaper(existing); }
-        else {
-          selectPaper({
-            arxiv_id: h.arxiv_id, title: h.title, authors: h.authors || [],
-            summary: "", categories: h.primary_category ? [h.primary_category] : [],
-            primary_category: h.primary_category || "", published: h.published || "",
-            updated: "", pdf_url: "", abs_url: h.abs_url || "",
-          });
+        if (existing) { selectView({ type: "smart", smart: "all" }); selectPaper(existing); return; }
+        // History only stores a summary line; show it at once, then fetch the
+        // full record (abstract, PDF link, comments) from arXiv.
+        selectPaper({
+          arxiv_id: h.arxiv_id, title: h.title, authors: h.authors || [],
+          summary: "Loading abstract…", categories: h.primary_category ? [h.primary_category] : [],
+          primary_category: h.primary_category || "", published: h.published || "",
+          updated: "", pdf_url: `https://arxiv.org/pdf/${h.arxiv_id}`, abs_url: h.abs_url || `https://arxiv.org/abs/${h.arxiv_id}`,
+        });
+        try {
+          const [full] = (await invoke("lookup_arxiv_ids", { input: h.arxiv_id })) || [];
+          if (full && state.selectedPaper?.arxiv_id === h.arxiv_id) selectPaper(full);
+        } catch {
+          if (state.selectedPaper?.arxiv_id === h.arxiv_id) $("#detail-abstract").textContent = "Couldn't load the abstract (offline?).";
         }
       };
       list.appendChild(card);
@@ -2020,16 +2125,16 @@ async function runAuthorSearch(author) {
   list.innerHTML = '<div class="loading">Searching by author…</div>';
   $("#list-title").textContent = "Search Results";
   const q = `au:"${author}"`;
-  searchPaging = { query: q, sort: "submittedDate", start: 0, pageSize: 50, done: false, loading: true };
+  searchPaging = { query: q, sort: "submittedDate", start: 0, pageSize: 50, total: 0, done: false, loading: true };
   state.searchResults = [];
   try {
-    const res = await invoke("search_arxiv", { query: q, sortBy: "submittedDate", maxResults: 50, start: 0 });
+    const { papers: res, total } = await invoke("search_arxiv", { query: q, sortBy: "submittedDate", maxResults: 50, start: 0 });
     state.searchResults = res;
     searchPaging.start = res.length;
-    searchPaging.done = res.length < 50;
+    searchPaging.total = total;
+    searchPaging.done = res.length < 50 || res.length >= total;
     searchPaging.loading = false;
     renderList();
-    attachInfiniteScroll();
     toast(`Papers by ${author}`);
   } catch (err) {
     searchPaging.loading = false;
@@ -2038,41 +2143,81 @@ async function runAuthorSearch(author) {
 }
 
 // ---------- Citation metrics (Semantic Scholar) ----------
-// Gentle throttle: process metric lookups one at a time with a small gap,
-// so a large library/feed doesn't hit Semantic Scholar's rate limit at once.
-const metricsQueue = [];
-let metricsRunning = false;
-async function processMetricsQueue() {
-  if (metricsRunning) return;
-  metricsRunning = true;
-  while (metricsQueue.length) {
-    const { container, base, resolve } = metricsQueue.shift();
-    // Skip if the container is no longer in the DOM (user navigated away).
-    if (!container.isConnected) { resolve(); continue; }
-    try {
-      const m = await invoke("fetch_paper_metrics", { arxivId: base });
-      state.metricsCache[base] = m;
-      if (container.isConnected) { container.classList.remove("metrics-loading"); renderMetrics(container, m); }
-    } catch (err) {
-      if (container.isConnected) { container.classList.remove("metrics-loading"); container.textContent = ""; }
-      if (String(err).includes("rate_limited")) await new Promise((r) => setTimeout(r, 3000));
+// Lookups are batched: every card that needs metrics registers its container,
+// and a short debounce later all pending ids go to Semantic Scholar in a
+// single batch request (hundreds of ids per call) instead of one throttled
+// request per paper. Results are cached in localStorage for a few days so
+// revisiting a list is instant and doesn't touch the network.
+const METRICS_TTL_MS = 3 * 24 * 3600 * 1000;
+const METRICS_STORE_KEY = "metricsCache.v1";
+const metricsWaiting = new Map(); // base id -> Set(container)
+let metricsTimer = null;
+let metricsInFlight = false;
+
+(function loadMetricsStore() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(METRICS_STORE_KEY) || "{}");
+    const now = Date.now();
+    for (const [id, entry] of Object.entries(raw)) {
+      if (entry && now - entry.t < METRICS_TTL_MS) state.metricsCache[id] = entry.m;
     }
-    resolve();
-    await new Promise((r) => setTimeout(r, 350)); // ~3 req/sec ceiling
-  }
-  metricsRunning = false;
+  } catch {}
+})();
+function persistMetricsStore(fresh) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(METRICS_STORE_KEY) || "{}");
+    const now = Date.now();
+    for (const m of fresh) raw[m.arxiv_id] = { t: now, m };
+    for (const [id, entry] of Object.entries(raw)) {
+      if (!entry || now - entry.t >= METRICS_TTL_MS) delete raw[id];
+    }
+    localStorage.setItem(METRICS_STORE_KEY, JSON.stringify(raw));
+  } catch {}
 }
 
-async function loadMetricsInto(container, arxivId) {
+async function flushMetrics() {
+  metricsTimer = null;
+  if (metricsInFlight) { metricsTimer = setTimeout(flushMetrics, 300); return; }
+  // Only fetch for ids whose cards are still on screen.
+  const ids = [];
+  for (const [id, set] of metricsWaiting) {
+    for (const c of set) if (!c.isConnected) set.delete(c);
+    if (set.size) ids.push(id); else metricsWaiting.delete(id);
+  }
+  if (!ids.length) return;
+  const batch = ids.slice(0, 400);
+  metricsInFlight = true;
+  try {
+    const results = await invoke("fetch_metrics_batch", { arxivIds: batch });
+    for (const m of results) {
+      state.metricsCache[m.arxiv_id] = m;
+      for (const c of metricsWaiting.get(m.arxiv_id) || []) {
+        if (c.isConnected) { c.classList.remove("metrics-loading"); renderMetrics(c, m); }
+      }
+      metricsWaiting.delete(m.arxiv_id);
+    }
+    persistMetricsStore(results);
+  } catch (err) {
+    // Leave cards blank on failure; they retry the next time they're rendered.
+    for (const id of batch) {
+      for (const c of metricsWaiting.get(id) || []) { c.classList.remove("metrics-loading"); c.textContent = ""; }
+      metricsWaiting.delete(id);
+    }
+  } finally {
+    metricsInFlight = false;
+  }
+  if (metricsWaiting.size) metricsTimer = setTimeout(flushMetrics, 300);
+}
+
+function loadMetricsInto(container, arxivId) {
   if (!container) return;
-  const base = arxivId.replace(/v\d+$/, "");
+  const base = baseId(arxivId);
   if (state.metricsCache[base]) { renderMetrics(container, state.metricsCache[base]); return; }
   container.classList.add("metrics-loading");
   container.textContent = "···";
-  return new Promise((resolve) => {
-    metricsQueue.push({ container, base, resolve });
-    processMetricsQueue();
-  });
+  if (!metricsWaiting.has(base)) metricsWaiting.set(base, new Set());
+  metricsWaiting.get(base).add(container);
+  if (!metricsTimer) metricsTimer = setTimeout(flushMetrics, 120);
 }
 
 function renderMetrics(container, m) {
@@ -2085,11 +2230,26 @@ function renderMetrics(container, m) {
   container.innerHTML = bits.join("");
 }
 
+// Update active/selected styling in place — no list rebuild, so it's cheap
+// and never disturbs scroll position or views that aren't paper lists.
+function refreshListHighlight() {
+  for (const card of document.querySelectorAll("#paper-list .paper-card[data-id]")) {
+    const id = card.dataset.id;
+    const sel = state.selectedIds.has(id);
+    card.classList.toggle("active", state.selectedPaper?.arxiv_id === id);
+    card.classList.toggle("multi-selected", sel);
+    const cb = card.querySelector(".card-check");
+    if (cb) cb.checked = sel;
+  }
+  const t = state.view.type;
+  if (t !== "history" && t !== "bibliography") renderSelectionToolbar(currentPapers());
+}
+
 function toggleSelect(id, papers) {
   if (state.selectedIds.has(id)) state.selectedIds.delete(id);
   else state.selectedIds.add(id);
   state.lastClickedId = id;
-  renderList();
+  refreshListHighlight();
 }
 
 function selectRange(fromId, toId, papers) {
@@ -2099,7 +2259,7 @@ function selectRange(fromId, toId, papers) {
   const [lo, hi] = a < b ? [a, b] : [b, a];
   for (let i = lo; i <= hi; i++) state.selectedIds.add(ids[i]);
   state.lastClickedId = toId;
-  renderList();
+  refreshListHighlight();
 }
 
 function renderSelectionToolbar(papers) {
@@ -2122,10 +2282,8 @@ function renderSelectionToolbar(papers) {
 
   if (searching) {
     actions.append(mkBtn("Add to Library", async () => {
-      for (const id of state.selectedIds) {
-        const p = resolvePaper(id);
-        if (p && !isSaved(id)) await invoke("save_paper", { paper: p, collectionId: null });
-      }
+      const papers = [...state.selectedIds].filter((id) => !isInLibrary(id)).map(resolvePaper).filter(Boolean);
+      if (papers.length) await invoke("save_papers", { papers, collectionId: null });
       state.selectedIds.clear();
       await loadLibrary();
       toast("Added to library");
@@ -2136,10 +2294,8 @@ function renderSelectionToolbar(papers) {
         state.collections.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
       sel.onchange = async () => {
         const cid = sel.value; if (!cid) return;
-        for (const id of state.selectedIds) {
-          const p = resolvePaper(id);
-          if (p) await invoke("save_paper", { paper: p, collectionId: cid });
-        }
+        const papers = [...state.selectedIds].map(resolvePaper).filter(Boolean);
+        await invoke("save_papers", { papers, collectionId: cid });
         state.selectedIds.clear();
         await loadLibrary();
         toast("Saved to collection");
@@ -2147,18 +2303,8 @@ function renderSelectionToolbar(papers) {
       actions.append(sel);
     }
   } else if (inTrash) {
-    actions.append(mkBtn("Restore", async () => {
-      for (const id of state.selectedIds) await invoke("set_trashed", { id, trashed: false });
-      state.selectedIds.clear(); await loadLibrary(); toast("Restored");
-    }));
-    actions.append(mkBtn("Delete permanently", async () => {
-      const ok = await window.__TAURI__.dialog.confirm(
-        `Permanently delete ${state.selectedIds.size} papers? This cannot be undone.`,
-        { title: "Delete permanently", kind: "warning" });
-      if (!ok) return;
-      for (const id of state.selectedIds) { await invoke("delete_pdf", { id }).catch(()=>{}); await invoke("delete_paper", { id }); }
-      state.selectedIds.clear(); await loadLibrary();
-    }, true));
+    actions.append(mkBtn("Restore", () => restorePapers([...state.selectedIds])));
+    actions.append(mkBtn("Delete permanently", () => deletePapersForever([...state.selectedIds]), true));
   } else {
     if (state.collections.length) {
       const sel = el("select", "save-collection-select");
@@ -2166,14 +2312,14 @@ function renderSelectionToolbar(papers) {
         state.collections.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
       sel.onchange = async () => {
         const cid = sel.value; if (!cid) return;
-        for (const id of state.selectedIds) await invoke("assign_paper", { paperId: id, collectionId: cid });
+        await invoke("bulk_assign", { ids: [...state.selectedIds], collectionId: cid });
         state.selectedIds.clear(); await loadLibrary(); toast("Added to collection");
       };
       actions.append(sel);
     }
     if (state.view.type === "collection") {
       actions.append(mkBtn("Remove from collection", async () => {
-        for (const id of state.selectedIds) await invoke("unassign_paper", { paperId: id, collectionId: state.view.id });
+        await invoke("bulk_unassign", { ids: [...state.selectedIds], collectionId: state.view.id });
         state.selectedIds.clear(); await loadLibrary();
       }));
     }
@@ -2182,12 +2328,9 @@ function renderSelectionToolbar(papers) {
       state.selectedIds.clear(); renderList();
       await addManyToBibliography(ids);
     }));
-    actions.append(mkBtn("Move to Trash", async () => {
-      for (const id of state.selectedIds) await invoke("set_trashed", { id, trashed: true });
-      state.selectedIds.clear(); await loadLibrary(); toast("Moved to Trash");
-    }, true));
+    actions.append(mkBtn("Move to Trash", () => trashPapers([...state.selectedIds]), true));
   }
-  actions.append(mkBtn("Clear", () => { state.selectedIds.clear(); renderList(); }));
+  actions.append(mkBtn("Clear", () => { state.selectedIds.clear(); refreshListHighlight(); }));
 
   // Select all papers currently shown in this view.
   const allShown = papers || currentPapers();
@@ -2195,7 +2338,7 @@ function renderSelectionToolbar(papers) {
   if (!allSelected) {
     const selAllBtn = mkBtn(`Select all (${allShown.length})`, () => {
       for (const p of allShown) state.selectedIds.add(p.arxiv_id);
-      renderList();
+      refreshListHighlight();
     });
     selAllBtn.classList.add("sel-all-btn");
     actions.prepend(selAllBtn);
@@ -2225,17 +2368,14 @@ function searchResultMenu(e, p) {
       }});
     } else {
       items.push({ label: "Add to Library", action: async () => {
-        if (resolvePaper(p.arxiv_id)) await invoke("save_paper", { paper: resolvePaper(p.arxiv_id), collectionId: null });
+        await invoke("save_papers", { papers: [resolvePaper(p.arxiv_id) || p], collectionId: null });
         await loadLibrary(); renderList(); toast("Added to library");
       }});
     }
   } else {
     items.push({ label: label("Add to Library"), action: async () => {
-      for (const id of targetIds) {
-        const pp = getPaper(id);
-        if (isTrashed(id)) { await invoke("set_trashed", { id, trashed: false }); }
-        else if (pp && !isInLibrary(id)) { await invoke("save_paper", { paper: pp, collectionId: null }); }
-      }
+      const papers = targetIds.filter((id) => !isInLibrary(id)).map(getPaper).filter(Boolean);
+      if (papers.length) await invoke("save_papers", { papers, collectionId: null });
       state.selectedIds.clear(); await loadLibrary(); renderList(); toast("Added to library");
     }});
   }
@@ -2243,7 +2383,7 @@ function searchResultMenu(e, p) {
     items.push({ sep: true });
     for (const c of state.collections) {
       items.push({ label: `${label("Add to")}: ${c.name}`, action: async () => {
-        for (const id of targetIds) { const pp = getPaper(id); if (pp) await invoke("save_paper", { paper: pp, collectionId: c.id }); }
+        await invoke("save_papers", { papers: targetIds.map(getPaper).filter(Boolean), collectionId: c.id });
         state.selectedIds.clear(); await loadLibrary(); renderList(); toast(`Saved to ${c.name}`);
       }});
     }
@@ -2265,27 +2405,9 @@ function paperMenu(e, p) {
   const inTrash = state.view.type === "smart" && state.view.smart === "trash";
 
   if (inTrash) {
-    items.push({ label: label("Restore"), action: async () => {
-      for (const id of targetIds) await invoke("set_trashed", { id, trashed: false });
-      state.selectedIds.clear();
-      await loadLibrary();
-      toast(multi ? `${targetIds.length} restored` : "Restored");
-    }});
+    items.push({ label: label("Restore"), action: () => restorePapers(targetIds) });
     items.push({ sep: true });
-    items.push({ label: label("Delete permanently"), danger: true, action: async () => {
-      const ok = await window.__TAURI__.dialog.confirm(
-        multi ? `Permanently delete ${targetIds.length} papers? This cannot be undone.`
-              : "Permanently delete this paper? This cannot be undone.",
-        { title: "Delete permanently", kind: "warning" });
-      if (!ok) return;
-      for (const id of targetIds) {
-        await invoke("delete_pdf", { id }).catch(() => {});
-        await invoke("delete_paper", { id });
-      }
-      state.selectedIds.clear();
-      if (state.selectedPaper && targetIds.includes(state.selectedPaper.arxiv_id)) clearDetail();
-      await loadLibrary();
-    }});
+    items.push({ label: label("Delete permanently"), danger: true, action: () => deletePapersForever(targetIds) });
     showContextMenu(e.clientX, e.clientY, items);
     return;
   }
@@ -2322,7 +2444,7 @@ function paperMenu(e, p) {
   items.push({ label: label("Add new tag…"), action: () =>
     openModal("New Tag", "", "Create", async (name) => {
       const t = await invoke("add_tag", { name, color: null });
-      for (const id of targetIds) await invoke("tag_paper", { paperId: id, tagId: t.id });
+      await invoke("bulk_tag", { ids: targetIds, tagId: t.id });
       await loadLibrary();
       toast(`Tagged with #${name}`);
     }) });
@@ -2333,7 +2455,8 @@ function paperMenu(e, p) {
 
   if (state.view.type === "collection") {
     items.push({ label: label("Remove from this collection"), action: async () => {
-      for (const id of targetIds) await invoke("unassign_paper", { paperId: id, collectionId: state.view.id });
+      await invoke("bulk_unassign", { ids: targetIds, collectionId: state.view.id });
+      state.selectedIds.clear();
       await loadLibrary();
     }});
   }
@@ -2358,8 +2481,8 @@ function paperMenu(e, p) {
   }
   // Reading status
   for (const st of ["unread", "reading", "read", "archived"]) {
-    items.push({ label: `Mark ${st}`, action: async () => {
-      for (const id of targetIds) await invoke("set_reading_status", { id, status: st });
+    items.push({ label: label(`Mark ${st}`), action: async () => {
+      await invoke("bulk_set_reading_status", { ids: targetIds, status: st });
       await loadLibrary();
     }});
   }
@@ -2377,13 +2500,7 @@ function paperMenu(e, p) {
       toast("PDF deleted");
     }});
   }
-  items.push({ label: label("Move to Trash"), danger: true, action: async () => {
-    for (const id of targetIds) await invoke("set_trashed", { id, trashed: true });
-    state.selectedIds.clear();
-    if (state.selectedPaper && targetIds.includes(state.selectedPaper.arxiv_id)) clearDetail();
-    await loadLibrary();
-    toast(multi ? `${targetIds.length} moved to Trash` : "Moved to Trash");
-  }});
+  items.push({ label: label("Move to Trash"), danger: true, action: () => trashPapers(targetIds) });
   showContextMenu(e.clientX, e.clientY, items);
 }
 
@@ -2423,7 +2540,7 @@ function selectPaper(p) {
   }
   // If the detail pane was collapsed, bring it back.
   if ($("#detail-pane").classList.contains("collapsed")) setDetailCollapsed(false);
-  renderList();
+  refreshListHighlight();
   $("#empty-detail").classList.add("hidden");
   const c = $("#detail-content");
   c.classList.remove("hidden");
@@ -2433,6 +2550,7 @@ function selectPaper(p) {
   const hasLocal = stored?.local_pdf_path;
   const doi = (stored?.doi) || p.doi;
   const journal = (stored?.journal_ref) || p.journal_ref;
+  const comment = (stored?.comment) || p.comment;
   const status = stored?.reading_status || "unread";
 
   // Mark as opened (fire-and-forget) when viewing a saved paper.
@@ -2453,6 +2571,8 @@ function selectPaper(p) {
     <h1>${esc(p.title)}</h1>
     <div class="detail-authors">${esc(p.authors.join(", "))}</div>
     ${journal ? `<div class="detail-journal">${esc(journal)}</div>` : ""}
+    ${comment ? `<div class="detail-comment" title="Author comments">${esc(comment)}</div>` : ""}
+    <div class="detail-dates">Submitted ${fmtDate(p.published)}${p.updated && fmtDate(p.updated) !== fmtDate(p.published) ? ` · updated ${fmtDate(p.updated)}` : ""}${stored?.added_at ? ` · added to library ${fmtDate(stored.added_at)}` : ""}</div>
     <div class="detail-cats">${p.categories.slice(0, 6).map((x) => `<span class="cat-chip">${esc(x)}</span>`).join("")}</div>
     <div class="doi-line">arXiv: <a href="#" id="open-abs2">${esc(p.arxiv_id)}</a>${doi ? ` &nbsp;&middot;&nbsp; DOI: <a href="#" id="open-doi">${esc(doi)}</a>` : ""}</div>
     <div class="card-metrics" id="detail-metrics" data-metrics="${esc(p.arxiv_id)}"></div>
@@ -2460,7 +2580,7 @@ function selectPaper(p) {
       <a href="#" id="open-abs">Abstract &#8599;</a>
       ${hasLocal ? `<button id="read-pdf">Read PDF</button>` : `<button id="dl-pdf">${saved ? "Download PDF" : "Save & Download PDF"}</button>`}
       ${hasLocal ? `<button id="del-pdf">Delete PDF</button>` : ""}
-      ${hasLocal ? "" : `<button id="open-preview">Open in Preview</button>`}
+      ${hasLocal ? "" : `<button id="open-preview" title="Open without saving to your library">${IS_MAC ? "Open in Preview" : "Open in PDF viewer"}</button>`}
       <button id="save-downloads">Save to Downloads</button>
       <button id="cite-paper" title="Resolve published DOI and add to Bibliography">Cite ▾</button>
       ${isTrashed(p.arxiv_id)
@@ -2641,6 +2761,8 @@ function selectPaper(p) {
       { label: "Add to Bibliography (arXiv version)", action: () => addPreprintToBibliography(p) },
       { sep: true },
       { label: "Copy BibTeX Entry (arXiv version)", action: () => { navigator.clipboard.writeText(bibtexEntry(p)); toast("BibTeX copied"); } },
+      { label: "Copy citation (text)", action: () => { navigator.clipboard.writeText(textCitation(p)); toast("Citation copied"); } },
+      { label: "Copy arXiv link", action: () => { navigator.clipboard.writeText(`https://arxiv.org/abs/${baseId(p.arxiv_id)}`); toast("Link copied"); } },
       { label: "Copy BibTeX Entry (published version)", action: async () => {
         toast("Resolving…");
         try {
@@ -2668,15 +2790,30 @@ function selectPaper(p) {
         ? renderMarkdown(noteEditor.value)
         : '<span style="color:var(--text-dim)">Click to add notes…</span>';
     };
-    noteRendered.addEventListener("click", startEdit);
-    noteEditor.addEventListener("blur", finishEdit);
+    const saveNote = async () => {
+      clearTimeout(t);
+      const s = state.papers.find((x) => x.arxiv_id === p.arxiv_id);
+      if (s && s.note === noteEditor.value) return;
+      try {
+        await invoke("update_note", { id: p.arxiv_id, note: noteEditor.value });
+        if (s) s.note = noteEditor.value;
+      } catch (err) { toast("Could not save note: " + err); }
+    };
+    noteRendered.addEventListener("click", (e) => {
+      if (e.target.closest("a")) return; // let links open instead of entering edit mode
+      startEdit();
+    });
+    noteEditor.addEventListener("blur", () => { saveNote(); finishEdit(); });
+    noteEditor.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" || (e.key === "Enter" && (e.metaKey || e.ctrlKey))) {
+        e.preventDefault();
+        e.stopPropagation();
+        noteEditor.blur();
+      }
+    });
     noteEditor.addEventListener("input", () => {
       clearTimeout(t);
-      t = setTimeout(async () => {
-        await invoke("update_note", { id: p.arxiv_id, note: noteEditor.value });
-        const s = state.papers.find((x) => x.arxiv_id === p.arxiv_id);
-        if (s) s.note = noteEditor.value;
-      }, 500);
+      t = setTimeout(saveNote, 500);
     });
   }
 }
@@ -3425,7 +3562,9 @@ function buildQuery() {
   return parts.join(" AND ");
 }
 
-let searchPaging = { query: "", sort: "relevance", start: 0, pageSize: 50, done: false, loading: false };
+// Paging state for the arXiv search view and, separately, the open saved search.
+let searchPaging = { query: "", sort: "relevance", start: 0, pageSize: 50, total: 0, done: false, loading: false };
+let savedPaging = { query: "", sort: "relevance", start: 0, pageSize: 50, total: 0, done: true, loading: false, savedId: null };
 
 function effectiveSort() {
   // If advanced panel is open, its sort wins; else use quick-sort.
@@ -3487,67 +3626,102 @@ function showSearchSuggestions() {
   wrap.appendChild(box);
 }
 
+// Pasting an arXiv id or link ("2401.01234", "arXiv:2401.01234v2",
+// "https://arxiv.org/abs/…", several separated by spaces/commas) fetches those
+// exact papers instead of running a keyword search. Returns true if handled.
+async function tryIdLookup(term) {
+  if (!/\d{4}\.\d{4,5}|\/\d{7}/.test(term)) return false; // cheap pre-check, no IPC for normal queries
+  const list = $("#paper-list");
+  list.innerHTML = '<div class="loading">Looking up arXiv id…</div>';
+  const papers = await invoke("lookup_arxiv_ids", { input: term });
+  if (!papers) return false; // not purely ids → normal search
+  searchPaging = { query: "", sort: "relevance", start: papers.length, pageSize: papers.length, total: papers.length, done: true, loading: false };
+  state.searchResults = papers;
+  renderList();
+  if (!papers.length) {
+    list.innerHTML = `<div class="empty-list"><div class="empty-icon">&#9888;</div><p>No arXiv paper found for “${esc(term)}”.</p></div>`;
+  } else if (papers.length === 1) {
+    state.lastClickedId = papers[0].arxiv_id;
+    selectPaper(papers[0]);
+  }
+  return true;
+}
+
 async function runSearch() {
+  const term = $("#search-input").value.trim();
   const query = buildQuery();
   if (!query) { toast("Enter a search term"); return; }
-  recordSearchHistory($("#search-input").value.trim());
+  recordSearchHistory(term);
   hideSearchSuggestions();
+  state.selectedIds.clear();
+  $("#list-title").textContent = "Search Results";
   const advOpen = !$("#adv-panel").classList.contains("hidden");
+  try {
+    if (!advOpen && await tryIdLookup(term)) return;
+  } catch (err) {
+    $("#paper-list").innerHTML = `<div class="empty-list"><div class="empty-icon">&#9888;</div><p>${esc(String(err))}</p></div>`;
+    return;
+  }
   const count = advOpen ? (parseInt($("#adv-count").value) || 50) : 50;
-  // Diagnostic: log the exact arXiv API query so it can be compared with the website.
-  console.log("[arXiv query]", query, "| sort:", effectiveSort());
-  searchPaging = { query, sort: effectiveSort(), start: 0, pageSize: count, done: false, loading: true };
+  searchPaging = { query, sort: effectiveSort(), start: 0, pageSize: count, total: 0, done: false, loading: true };
   state.searchResults = [];
   const list = $("#paper-list");
   list.innerHTML = '<div class="loading">Querying arXiv…</div>';
-  $("#list-title").textContent = "Search Results";
+  list.scrollTop = 0;
+  const mine = searchPaging;
   try {
-    const res = await invoke("search_arxiv", { query, sortBy: searchPaging.sort, maxResults: count, start: 0 });
+    const { papers: res, total } = await invoke("search_arxiv", { query, sortBy: searchPaging.sort, maxResults: count, start: 0 });
+    if (searchPaging !== mine) return; // a newer search replaced this one
     state.searchResults = res;
     searchPaging.start = res.length;
-    searchPaging.done = res.length < count;
+    searchPaging.total = total;
+    searchPaging.done = res.length < count || res.length >= total;
     searchPaging.loading = false;
-    renderList();
-    attachInfiniteScroll();
+    if (state.view.type === "search") renderList();
   } catch (err) {
     searchPaging.loading = false;
     list.innerHTML = `<div class="empty-list"><div class="empty-icon">&#9888;</div><p>${esc(String(err))}</p></div>`;
   }
 }
 
+// Next page for the arXiv search or the open saved search.
 async function loadMoreSearch() {
-  if (searchPaging.loading || searchPaging.done || state.view.type !== "search") return;
-  searchPaging.loading = true;
+  const isSaved = state.view.type === "saved";
+  if (state.view.type !== "search" && !isSaved) return;
+  const paging = isSaved ? savedPaging : searchPaging;
+  if (isSaved && paging.savedId !== state.view.id) return;
+  if (paging.loading || paging.done || !paging.query) return;
+  paging.loading = true;
   const moreEl = el("div", "loading", "Loading more…");
   $("#paper-list").appendChild(moreEl);
   try {
-    const res = await invoke("search_arxiv", {
-      query: searchPaging.query, sortBy: searchPaging.sort,
-      maxResults: searchPaging.pageSize, start: searchPaging.start,
+    const { papers: res, total } = await invoke("search_arxiv", {
+      query: paging.query, sortBy: paging.sort,
+      maxResults: paging.pageSize, start: paging.start,
     });
+    if ((isSaved ? savedPaging : searchPaging) !== paging) return; // a new search started meanwhile
+    const target = isSaved ? state.savedResults : state.searchResults;
     // Dedupe by arxiv_id in case of overlap.
-    const seen = new Set(state.searchResults.map((p) => p.arxiv_id));
-    const fresh = res.filter((p) => !seen.has(p.arxiv_id));
-    state.searchResults.push(...fresh);
-    searchPaging.start += res.length;
-    searchPaging.done = res.length < searchPaging.pageSize;
-    renderList();
+    const seen = new Set(target.map((p) => p.arxiv_id));
+    target.push(...res.filter((p) => !seen.has(p.arxiv_id)));
+    paging.start += res.length;
+    paging.total = total || paging.total;
+    paging.done = res.length < paging.pageSize || paging.start >= paging.total;
+    if (isSaved) state.savedSearchCache[paging.savedId] = { results: target, paging };
+    if (state.view.type === (isSaved ? "saved" : "search")) renderList();
   } catch (err) {
+    moreEl.remove();
     toast("Could not load more: " + err);
   } finally {
-    searchPaging.loading = false;
+    paging.loading = false;
   }
 }
 
-function attachInfiniteScroll() {
+// Infinite scroll for fetched result lists (wired once at startup).
+$("#paper-list").addEventListener("scroll", () => {
   const list = $("#paper-list");
-  list.onscroll = () => {
-    if (state.view.type !== "search") return;
-    if (list.scrollTop + list.clientHeight >= list.scrollHeight - 80) {
-      loadMoreSearch();
-    }
-  };
-}
+  if (list.scrollTop + list.clientHeight >= list.scrollHeight - 120) loadMoreSearch();
+}, { passive: true });
 
 // ---------- Modal ----------
 function openModal(title, value, okLabel, onOk) {
@@ -4149,7 +4323,12 @@ const SHORTCUTS = [
   { keys: [MOD, "+"], desc: "Increase font size" },
   { keys: [MOD, "−"], desc: "Decrease font size" },
   { keys: [MOD, "0"], desc: "Reset font size" },
-  { keys: ["↑", "↓"], desc: "Navigate papers in the list" },
+  { keys: ["/"], desc: "Focus search / library filter" },
+  { keys: ["↑", "↓"], desc: "Navigate papers in the list (also J / K)" },
+  { keys: ["S"], desc: "Save the selected search result to your library" },
+  { keys: ["O"], desc: "Open the selected paper's PDF" },
+  { keys: ["A"], desc: "Open the selected paper's arXiv page" },
+  { keys: [MOD, "A"], desc: "Select all papers in the list" },
   { keys: ["⌫"], desc: "Move selected paper(s) to Trash" },
   { keys: ["Esc"], desc: "Close popups / overlays" },
   { keys: [MOD, "click"], desc: "Multi-select papers, collections, tags" },
@@ -4406,6 +4585,21 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
+  // Escape closes whichever dialog is open, even while typing inside it.
+  if (e.key === "Escape") {
+    const dialogs = [
+      ["#modal", () => $("#modal").classList.add("hidden")],
+      ["#saved-search-modal", () => $("#saved-search-modal").classList.add("hidden")],
+      ["#category-modal", () => $("#category-modal").classList.add("hidden")],
+      ["#edge-modal", () => $("#edge-cancel").click()],
+      ["#color-modal", () => $("#color-cancel").click()],
+    ];
+    for (const [sel, close] of dialogs) {
+      if (!$(sel).classList.contains("hidden")) { e.preventDefault(); close(); return; }
+    }
+    if (document.querySelector(".ctx-menu")) { closeAllCtxMenus(); return; }
+  }
+
   // Quick search: Cmd+K (Mac) / Ctrl+K (Linux/Win). Opens a small popup that
   // jumps to the arXiv search panel and runs the query.
   if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
@@ -4457,6 +4651,48 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (typing) return;
+  // Single-key shortcuts must not fire behind an open dialog.
+  const anyDialog = ["#modal", "#saved-search-modal", "#category-modal", "#edge-modal", "#color-modal",
+    "#settings-overlay", "#name-modal", "#onboarding-overlay", "#quick-search-overlay"]
+    .some((sel) => !$(sel).classList.contains("hidden"));
+  if (anyDialog && e.key !== "Escape") return;
+  const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
+  const listView = !["graph", "history", "bibliography"].includes(state.view.type);
+
+  if (plain && e.key === "/") {
+    e.preventDefault();
+    if (state.view.type === "search") $("#search-input").focus();
+    else if (!$("#library-controls").classList.contains("hidden")) $("#lib-filter").focus();
+    else { selectView({ type: "search" }); $("#search-input").focus(); }
+    return;
+  }
+  if ((e.metaKey || e.ctrlKey) && (e.key === "a" || e.key === "A") && listView) {
+    e.preventDefault();
+    for (const p of currentPapers()) state.selectedIds.add(p.arxiv_id);
+    refreshListHighlight();
+    return;
+  }
+  const cur = state.selectedPaper;
+  if (plain && cur && listView) {
+    const k = e.key.toLowerCase();
+    if (k === "s" && !isInLibrary(cur.arxiv_id)) {
+      e.preventDefault();
+      saveWithDupCheck(cur).then((did) => {
+        if (did) selectPaper(state.papers.find((x) => x.arxiv_id === cur.arxiv_id) || cur);
+      });
+      return;
+    }
+    if (k === "o") {
+      e.preventDefault();
+      ($("#read-pdf") || $("#open-preview"))?.click();
+      return;
+    }
+    if (k === "a") {
+      e.preventDefault();
+      openUrl(cur.abs_url || `https://arxiv.org/abs/${cur.arxiv_id}`);
+      return;
+    }
+  }
   // Trash: Backspace/Delete on selected papers (or the open one). Library views only.
   if ((e.key === "Backspace" || e.key === "Delete")) {
     const inLibraryView = state.view.type === "collection" ||
@@ -4468,13 +4704,7 @@ document.addEventListener("keydown", (e) => {
         : (state.selectedPaper ? [state.selectedPaper.arxiv_id] : []);
       if (ids.length) {
         e.preventDefault();
-        (async () => {
-          for (const id of ids) await invoke("set_trashed", { id, trashed: true });
-          state.selectedIds.clear();
-          if (state.selectedPaper && ids.includes(state.selectedPaper.arxiv_id)) clearDetail();
-          await loadLibrary();
-          toast(ids.length > 1 ? `${ids.length} moved to Trash` : "Moved to Trash");
-        })();
+        trashPapers(ids);
       }
       return;
     }
@@ -4483,26 +4713,19 @@ document.addEventListener("keydown", (e) => {
         : (state.selectedPaper ? [state.selectedPaper.arxiv_id] : []);
       if (ids.length) {
         e.preventDefault();
-        (async () => {
-          const ok = await window.__TAURI__.dialog.confirm(
-            `Permanently delete ${ids.length} paper${ids.length > 1 ? "s" : ""}? This cannot be undone.`,
-            { title: "Delete permanently", kind: "warning" });
-          if (!ok) return;
-          for (const id of ids) { await invoke("delete_pdf", { id }).catch(()=>{}); await invoke("delete_paper", { id }); }
-          state.selectedIds.clear();
-          if (state.selectedPaper && ids.includes(state.selectedPaper.arxiv_id)) clearDetail();
-          await loadLibrary();
-        })();
+        deletePapersForever(ids);
       }
       return;
     }
   }
-  // Arrow navigation through the current list
-  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+  // Arrow (or j/k) navigation through the current list
+  const down = e.key === "ArrowDown" || (plain && e.key === "j");
+  const up = e.key === "ArrowUp" || (plain && e.key === "k");
+  if ((down || up) && listView) {
     const papers = currentPapers();
     if (!papers.length) return;
     const idx = papers.findIndex((p) => p.arxiv_id === state.selectedPaper?.arxiv_id);
-    let next = e.key === "ArrowDown" ? idx + 1 : idx - 1;
+    let next = down ? idx + 1 : idx - 1;
     next = Math.max(0, Math.min(papers.length - 1, next));
     selectPaper(papers[next]);
     document.querySelectorAll(".paper-card")[next]?.scrollIntoView({ block: "nearest" });
@@ -4692,8 +4915,7 @@ $("#rename-user").onclick = () =>
 
 // Feedback → opens email to developer
 $("#send-feedback").onclick = () => {
-  // TODO: replace with your actual GitHub profile/repo URL.
-  openUrl("https://github.com");
+  openUrl("https://github.com/Pankajsharma05/ArXiv-Library-releases/issues");
 };
 
 // Graph sidebar visibility toggle

@@ -127,14 +127,29 @@ impl SettingsStore {
         self.persist(&s);
     }
 
-    /// Replace name + followed categories from an imported settings blob
-    /// (used by settings export/import). Usage history is merged, not replaced.
-    pub fn import_from(&self, other: &Settings) {
+    /// Apply an imported settings blob (used by settings export/import).
+    /// `raw` is the same file as parsed JSON, used to tell "field absent"
+    /// (older export — keep current value) from "field present". Usage history
+    /// is merged, not replaced.
+    pub fn import_from(&self, other: &Settings, raw: &serde_json::Value) {
         let mut s = self.inner.lock().unwrap();
+        let has = |k: &str| raw.get(k).is_some();
         if other.name.is_some() { s.name = other.name.clone(); }
         if !other.followed_categories.is_empty() {
             s.followed_categories = other.followed_categories.clone();
         }
+        if !other.saved_searches.is_empty() {
+            // Merge by id so importing never drops searches made on this machine.
+            for ss in &other.saved_searches {
+                match s.saved_searches.iter_mut().find(|x| x.id == ss.id) {
+                    Some(existing) => *existing = ss.clone(),
+                    None => s.saved_searches.push(ss.clone()),
+                }
+            }
+        }
+        if has("history_enabled") { s.history_enabled = other.history_enabled; }
+        if has("font_scale") { s.font_scale = other.font_scale.clamp(70, 160); }
+        if has("font_family") { s.font_family = other.font_family.clone(); }
         for (k, v) in &other.usage {
             let e = s.usage.entry(k.clone()).or_insert(0);
             *e = (*e).max(*v); // keep the larger of the two for any given day

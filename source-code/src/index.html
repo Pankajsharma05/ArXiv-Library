@@ -90,7 +90,7 @@
       <div id="search-panel" class="hidden">
         <div id="search-bar">
           <div class="search-input-wrap">
-            <input id="search-input" type="text" placeholder="Search arXiv" />
+            <input id="search-input" type="text" placeholder="Search arXiv, or paste an arXiv id / link" />
             <button id="search-clear" class="search-clear hidden" title="Clear">&times;</button>
           </div>
           <select id="quick-sort" title="Sort results">
@@ -190,7 +190,7 @@
       </div>
       <div id="library-controls" class="hidden">
         <div class="search-input-wrap lib-filter-wrap">
-          <input id="lib-filter" type="text" placeholder="Filter saved papers…" />
+          <input id="lib-filter" type="text" placeholder="Filter by words, authors, notes, #tag…" />
           <button id="lib-filter-clear" class="search-clear hidden" title="Clear">&times;</button>
         </div>
         <select id="lib-sort">
@@ -199,6 +199,7 @@
           <option value="title">Title</option>
           <option value="author">First author</option>
           <option value="opened">Last opened</option>
+          <option value="citations">Citations</option>
         </select>
         <select id="lib-status">
           <option value="">All</option>
@@ -289,7 +290,7 @@
   <div id="quick-search-overlay" class="hidden">
     <div class="quick-search-box">
       <span class="qs-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
-      <input id="quick-search-input" type="text" placeholder="Quick search arXiv…" autocomplete="off" />
+      <input id="quick-search-input" type="text" placeholder="Quick search arXiv, or paste an arXiv id…" autocomplete="off" />
       <span class="qs-hint">↵ to search · esc to close</span>
     </div>
   </div>
@@ -433,7 +434,7 @@
       </div>
       <div class="onboard-feature">
         <span class="of-icon">⌨</span>
-        <span class="of-text"><strong>Tips</strong> — ⌘F to filter, ↑/↓ to navigate, collapse panels from the header/corner, and find time stats + feedback in Settings.</span>
+        <span class="of-text"><strong>Tips</strong> — paste an arXiv link into search to open it directly · <kbd>/</kbd> to search or filter · ↑/↓ (or J/K) to navigate · <kbd>S</kbd> save · <kbd>O</kbd> open PDF · ⌘/ lists every shortcut.</span>
       </div>
       <div class="modal-actions">
         <button id="onboard-done" class="btn-primary">Start exploring</button>
@@ -586,7 +587,7 @@
         <div class="settings-label">About</div>
         <div class="about-text">
           <strong>ArXivLibrary</strong><br/>
-          Version 1.0<br/><br/>
+          Version 1.1<br/><br/>
           An arXiv-native research library — search, organize, annotate, and connect papers.<br/><br/>
           Developed by Pankaj Sharma.<br/>
           Built with Tauri, Rust, and Claude (Anthropic).<br/><br/>
