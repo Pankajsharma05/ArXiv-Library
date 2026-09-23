@@ -36,6 +36,7 @@ little smoother. It's shared freely in the hope that others find it useful.
 - **Citations & venues** — enriched via Semantic Scholar
 - **Custom themes** — full palette engine from base + accent colors
 - **PDF handling** — download (verified to be a real PDF before saving) and open in your system PDF viewer
+- **Source figures** — pull the original figure files from a paper's LaTeX source, numbered and captioned; save them to Downloads or keep them in your library
 - **Keyboard-first** — `/` search, `J`/`K` navigate, `S` save, `O` open PDF, undo for trash; ⌘/ lists every shortcut
 
 See [CHANGELOG.md](CHANGELOG.md) for what's new.
@@ -49,12 +50,12 @@ Grab the latest build for your platform from the
 
 | Platform | File | Notes |
 |----------|------|-------|
-| **Windows** | `ArXivLibrary_v1.1.0_x64_en-US.msi` | Windows 10/11, 64-bit |
-| **Windows** (alt.) | `ArXivLibrary_v1.1.0_x64-setup.exe` | Setup-wizard installer |
-| **macOS** | `ArXivLibrary_macOS_v1.1.0.dmg` | Apple Silicon |
-| **Linux** | `ArXivLibrary_v1.1.0_amd64.deb` | Debian / Ubuntu, 64-bit |
-| **Linux** | `ArXivLibrary_v1.1.0_amd64.AppImage` | Portable, any distro (`chmod +x`, then run) |
-| **Linux** | `ArXivLibrary_v1.1.0_x86_64.rpm` | Fedora / RHEL |
+| **Windows** | `ArXivLibrary_v1.2.0_x64_en-US.msi` | Windows 10/11, 64-bit |
+| **Windows** (alt.) | `ArXivLibrary_v1.2.0_x64-setup.exe` | Setup-wizard installer |
+| **macOS** | `ArXivLibrary_macOS_v1.2.0.dmg` | Apple Silicon |
+| **Linux** | `ArXivLibrary_v1.2.0_amd64.deb` | Debian / Ubuntu, 64-bit |
+| **Linux** | `ArXivLibrary_v1.2.0_amd64.AppImage` | Portable, any distro (`chmod +x`, then run) |
+| **Linux** | `ArXivLibrary_v1.2.0_x86_64.rpm` | Fedora / RHEL |
 
 > **Availability:** builds are currently provided for Apple Silicon Macs,
 > 64-bit Windows (x64), and 64-bit Linux (x86_64: .deb, .AppImage, .rpm).
@@ -65,14 +66,14 @@ Grab the latest build for your platform from the
 
 ```bash
 # Windows (PowerShell) — download, then double-click to run the installer
-curl.exe -L -O https://github.com/Pankajsharma05/ArXiv-Library/releases/download/v1.1.0/ArXivLibrary_v1.1.0_x64_en-US.msi
+curl.exe -L -O https://github.com/Pankajsharma05/ArXiv-Library/releases/download/v1.2.0/ArXivLibrary_v1.2.0_x64_en-US.msi
 
 # macOS (Apple Silicon)
-curl -L -O https://github.com/Pankajsharma05/ArXiv-Library/releases/download/v1.1.0/ArXivLibrary_macOS_v1.1.0.dmg
+curl -L -O https://github.com/Pankajsharma05/ArXiv-Library/releases/download/v1.2.0/ArXivLibrary_macOS_v1.2.0.dmg
 
 # Linux (Debian / Ubuntu)
-curl -L -O https://github.com/Pankajsharma05/ArXiv-Library/releases/download/v1.1.0/ArXivLibrary_v1.1.0_amd64.deb
-sudo dpkg -i ArXivLibrary_v1.1.0_amd64.deb
+curl -L -O https://github.com/Pankajsharma05/ArXiv-Library/releases/download/v1.2.0/ArXivLibrary_v1.2.0_amd64.deb
+sudo dpkg -i ArXivLibrary_v1.2.0_amd64.deb
 ```
 
 ---
@@ -97,7 +98,7 @@ xattr -cr /Applications/ArXivLibrary.app
 **Linux** — Install the `.deb` with:
 
 ```bash
-sudo dpkg -i ArXivLibrary_v1.1.0_amd64.deb
+sudo dpkg -i ArXivLibrary_v1.2.0_amd64.deb
 ```
 
 If dependencies are missing, follow up with `sudo apt-get install -f`.

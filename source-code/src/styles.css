@@ -57,7 +57,6 @@
 
 :root {
   --radius: 8px;
-  --font-scale: 1;
   --app-font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "Ubuntu", system-ui, sans-serif;
   font-family: var(--app-font);
 }
@@ -142,21 +141,15 @@ body {
 }
 ::-webkit-scrollbar-corner { background: transparent; }
 
-/* Scale the entire UI. The CSS `zoom` property is WebKit-only and misbehaves on
-   Linux (WebKitGTK), so we use transform: scale() which works on every platform.
-   transform-origin top-left keeps the app anchored; the compensating width/height
-   (100% / scale) ensure the scaled app still fills the window exactly. */
+/* UI scaling (Ctrl +/-) uses the webview's native zoom; see applyAppearance.
+   Zooming in shrinks the viewport in CSS pixels, so the two fixed columns give
+   way (down to a floor) and the last column never gets squeezed to a sliver. */
 #app {
   display: grid;
-  grid-template-columns: var(--w-sidebar, 230px) 5px var(--w-list, 360px) 5px 1fr;
+  grid-template-columns:
+    min(var(--w-sidebar, 230px), max(200px, 24vw)) 5px
+    min(var(--w-list, 360px), max(280px, 38vw)) 5px minmax(0, 1fr);
   height: 100vh;
-}
-/* Scale the UI crisply. `zoom` re-lays-out text at native resolution (no pixel
-   blur, unlike transform: scale). Supported on WebKit and modern WebKitGTK
-   (2.44+, 2024). Only applied when actually zoomed so the default is untouched. */
-#app.zoomed {
-  zoom: var(--font-scale);
-  height: calc(100vh / var(--font-scale));
 }
 #app > #sidebar { order: 0; }
 #app > #resizer-1 { order: 1; }
@@ -184,7 +177,7 @@ body {
 #sidebar {
   background: var(--bg-elev);
   padding: 12px;
-  overflow-y: auto;
+  overflow-y: auto; overflow-x: hidden;
   display: flex; flex-direction: column;
 }
 .sidebar-header {
@@ -1037,3 +1030,66 @@ body {
 #search-bar > .search-input-wrap { flex: 1 1 100%; }
 #search-bar #quick-sort { flex: 1 1 auto; min-height: 32px; }
 #search-bar #adv-toggle, #search-bar #search-btn { white-space: nowrap; }
+
+/* ---------- Source figures ---------- */
+#figures-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 215;
+  display: flex; align-items: center; justify-content: center;
+}
+.figures-panel {
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 14px;
+  width: 1100px; max-width: 94vw; height: 88vh; display: flex; flex-direction: column;
+  box-shadow: 0 10px 40px var(--shadow);
+}
+.figures-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 20px 24px 10px; }
+.figures-title-wrap { min-width: 0; }
+.figures-head h2 { font-size: 19px; }
+.figures-paper { color: var(--text-dim); font-size: 13px; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.figures-toolbar {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
+  padding: 6px 24px 14px; border-bottom: 1px solid var(--border);
+}
+.figures-status { font-size: 13px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.figures-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.figures-actions button:disabled { opacity: 0.45; cursor: default; }
+.figures-body { overflow-y: auto; padding: 4px 24px 24px; flex: 1; }
+.figures-section-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text-dim); margin: 18px 0 10px;
+}
+.figures-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+.fig-card {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--bg);
+  display: flex; flex-direction: column; overflow: hidden; min-width: 0;
+}
+.fig-card.selected { border-color: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent-soft); }
+/* Figures are drawn for white paper, so previews sit on white in both themes. */
+.fig-thumb {
+  height: 170px; background: #fff; display: flex; align-items: center; justify-content: center;
+  cursor: zoom-in; border-bottom: 1px solid var(--border); padding: 6px;
+}
+.fig-thumb img, .fig-thumb canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+.fig-thumb.no-file { background: var(--bg-elev2); cursor: default; }
+.fig-thumb-note { color: #6a7080; font-size: 12px; text-align: center; padding: 12px; line-height: 1.45; }
+.fig-thumb.no-file .fig-thumb-note { color: var(--text-dim); }
+.fig-meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px 2px; font-size: 13px; }
+.fig-check { display: flex; align-items: center; gap: 6px; cursor: pointer; min-width: 0; }
+.fig-check strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fig-kind { color: var(--text-dim); font-size: 11.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.fig-caption {
+  font-size: 12.5px; line-height: 1.45; padding: 4px 10px; cursor: pointer;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.fig-caption.expanded { display: block; }
+.fig-caption.empty { color: var(--text-dim); font-style: italic; cursor: default; }
+.fig-card-actions { display: flex; gap: 6px; padding: 6px 10px 10px; margin-top: auto; }
+.fig-card-actions button {
+  font-size: 12px; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-elev); color: var(--text);
+}
+.fig-card-actions button:hover { border-color: var(--accent-soft); }
+.figures-empty { color: var(--text-dim); padding: 48px 16px; text-align: center; font-size: 14px; line-height: 1.5; }
+@media (max-width: 640px) {
+  .figures-panel { max-width: 100vw; height: 100vh; border-radius: 0; }
+  .figures-head, .figures-toolbar, .figures-body { padding-left: 16px; padding-right: 16px; }
+}

@@ -360,8 +360,10 @@ function initResizers() {
     };
     resizer.addEventListener("mousedown", (e) => {
       startX = e.clientX;
-      const cur = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
-      startW = parseInt(cur) || (varName === "--w-sidebar" ? 230 : 360);
+      // Start from the rendered width: a narrow or zoomed window may be showing
+      // the column narrower than the saved value.
+      const cols = getComputedStyle($("#app")).gridTemplateColumns.split(" ");
+      startW = parseFloat(cols[varName === "--w-sidebar" ? 0 : 2]) || (varName === "--w-sidebar" ? 230 : 360);
       resizer.classList.add("dragging");
       document.addEventListener("mousemove", onMove);
       document.addEventListener("mouseup", onUp);
@@ -2500,9 +2502,283 @@ function paperMenu(e, p) {
       toast("PDF deleted");
     }});
   }
+  if (!multi) items.push({ label: "Show figures", action: () => openFigures(p) });
   items.push({ label: label("Move to Trash"), danger: true, action: () => trashPapers(targetIds) });
   showContextMenu(e.clientX, e.clientY, items);
 }
+
+// ---------- Source figures ----------
+// Figures come from the paper's LaTeX source on arXiv (see figures.rs). The
+// panel previews them and saves them to Downloads or keeps them in the library.
+const figs = { paper: null, set: null, token: 0, selected: new Set(), urls: [], observer: null };
+const FIG_MIME = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", svg: "image/svg+xml" };
+const FIG_PREVIEW_MAX = 40 * 1024 * 1024;
+
+const figLabel = (f) => (f.number != null ? `Fig. ${f.number}${f.part || ""}` : f.file || "Image");
+const setFigStatus = (text) => { $("#figures-status").textContent = text; };
+// A file can appear under two figure numbers; count it once.
+const figFiles = (set) => [...new Map(set.figures.filter((f) => f.path).map((f) => [f.file, f])).values()];
+
+function refreshFiguresButton(arxivId, set) {
+  const btn = $("#show-figures");
+  if (!btn || state.selectedPaper?.arxiv_id !== arxivId) return;
+  const n = figFiles(set).length;
+  btn.textContent = `Figures (${n})`;
+}
+
+async function openFigures(p) {
+  const token = ++figs.token;
+  figs.paper = p;
+  figs.set = null;
+  figs.selected.clear();
+  cleanupFigureThumbs();
+  $("#figures-paper").textContent = p.title;
+  $("#figures-body").innerHTML = "";
+  $("#figures-overlay").classList.remove("hidden");
+  renderFigureToolbar();
+  setFigStatus("Getting the paper's source from arXiv…");
+
+  const tag = `figures:${p.arxiv_id}`;
+  downloadProgressCbs[tag] = (prog) => {
+    if (token !== figs.token) return;
+    if (prog.done) { setFigStatus("Extracting figures…"); return; }
+    setFigStatus(prog.total > 0
+      ? `Downloading source… ${Math.round((prog.received / prog.total) * 100)}% of ${fmtBytes(prog.total)}`
+      : `Downloading source… ${fmtBytes(prog.received)}`);
+  };
+  try {
+    const set = await invoke("fetch_figures", { arxivId: p.arxiv_id });
+    if (token !== figs.token) return;
+    figs.set = set;
+    renderFigures();
+    refreshFiguresButton(p.arxiv_id, set);
+  } catch (err) {
+    if (token !== figs.token) return;
+    setFigStatus("");
+    $("#figures-body").innerHTML = `<div class="figures-empty">${esc(String(err))}</div>`;
+  } finally {
+    delete downloadProgressCbs[tag];
+  }
+}
+
+function closeFigures() {
+  figs.token++;
+  figs.paper = null;
+  figs.set = null;
+  cleanupFigureThumbs();
+  $("#figures-body").innerHTML = "";
+  $("#figures-overlay").classList.add("hidden");
+}
+
+function cleanupFigureThumbs() {
+  figs.observer?.disconnect();
+  figs.observer = null;
+  figs.urls.forEach((u) => URL.revokeObjectURL(u));
+  figs.urls = [];
+}
+
+function renderFigureToolbar() {
+  const set = figs.set;
+  const files = set ? figFiles(set) : [];
+  const sel = figs.selected.size;
+  $("#fig-save-all").disabled = !files.length;
+  $("#fig-save-selected").disabled = !sel;
+  $("#fig-save-selected").textContent = sel ? `Save ${sel} selected` : "Save selected";
+  $("#fig-keep").disabled = !files.length;
+  $("#fig-keep").textContent = set?.in_library ? "Remove from library" : "Keep in library";
+  $("#fig-keep").title = set?.in_library
+    ? "Delete the kept copy (it stays viewable until the temp cache is cleared)"
+    : "Store these figures with your library so they are available offline";
+  $("#fig-open-folder").disabled = !files.length;
+  if (!set) return;
+  const numbered = new Set(set.figures.filter((f) => f.number != null).map((f) => f.number)).size;
+  const code = set.figures.filter((f) => f.kind === "code").length;
+  const bytes = files.reduce((n, f) => n + f.bytes, 0);
+  setFigStatus([
+    `${numbered} figure${numbered === 1 ? "" : "s"}`,
+    `${files.length} image file${files.length === 1 ? "" : "s"} (${fmtBytes(bytes)})`,
+    code ? `${code} drawn in LaTeX` : "",
+    set.in_library ? "kept in library" : "temporary copy",
+  ].filter(Boolean).join(" · "));
+}
+
+function figureCard(f, i) {
+  const size = f.bytes ? ` · ${f.bytes < 1048576 ? Math.max(1, Math.round(f.bytes / 1024)) + " KB" : fmtBytes(f.bytes)}` : "";
+  const caption = f.caption
+    ? `<div class="fig-caption" title="Click to expand">${esc(f.caption)}</div>`
+    : `<div class="fig-caption empty">${f.number != null ? "No caption" : esc(f.source || "")}</div>`;
+  if (!f.path) {
+    const note = f.kind === "code"
+      ? "Made with LaTeX itself (e.g. TikZ or a code listing), so there is no image file to save."
+      : `The source references <code>${esc(f.source || "an image")}</code> but doesn't include it.`;
+    return `<div class="fig-card" data-idx="${i}">
+      <div class="fig-thumb no-file"><span class="fig-thumb-note">${note}</span></div>
+      <div class="fig-meta"><strong>${esc(figLabel(f))}</strong></div>
+      ${caption}
+      <div class="fig-card-actions">${f.caption ? `<button data-act="copy">Copy caption</button>` : ""}</div>
+    </div>`;
+  }
+  const checked = figs.selected.has(f.file);
+  return `<div class="fig-card${checked ? " selected" : ""}" data-idx="${i}">
+    <div class="fig-thumb" title="Open in your default viewer"><span class="fig-thumb-note">Loading…</span></div>
+    <div class="fig-meta">
+      <label class="fig-check"><input type="checkbox"${checked ? " checked" : ""}><strong>${esc(figLabel(f))}</strong></label>
+      <span class="fig-kind">${esc(f.kind.toUpperCase())}${size}</span>
+    </div>
+    ${caption}
+    <div class="fig-card-actions">
+      <button data-act="open">Open</button>
+      <button data-act="save">Save</button>
+      ${f.caption ? `<button data-act="copy">Copy caption</button>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderFigures() {
+  const set = figs.set;
+  cleanupFigureThumbs();
+  renderFigureToolbar();
+  const body = $("#figures-body");
+  if (!set.figures.length) {
+    body.innerHTML = `<div class="figures-empty">No figures in this paper's source.</div>`;
+    return;
+  }
+  const indexed = set.figures.map((f, i) => [f, i]);
+  const section = (title, list) => list.length
+    ? `<div class="figures-section-label">${title}</div>
+       <div class="figures-grid">${list.map(([f, i]) => figureCard(f, i)).join("")}</div>`
+    : "";
+  body.innerHTML =
+    section("Figures", indexed.filter(([f]) => f.number != null)) +
+    section("Other images in the source", indexed.filter(([f]) => f.number == null));
+
+  // Load previews as cards scroll into view.
+  figs.observer = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      figs.observer.unobserve(e.target);
+      const card = e.target.closest(".fig-card");
+      loadFigureThumb(e.target, set.figures[+card.dataset.idx], figs.token);
+    }
+  }, { root: body, rootMargin: "200px" });
+
+  body.querySelectorAll(".fig-card").forEach((card) => {
+    const f = set.figures[+card.dataset.idx];
+    const thumb = card.querySelector(".fig-thumb");
+    if (f.path) {
+      figs.observer.observe(thumb);
+      thumb.onclick = () => openPath(f.path).catch((err) => toast(String(err)));
+    }
+    card.querySelector("input[type=checkbox]")?.addEventListener("change", (ev) => {
+      if (ev.target.checked) figs.selected.add(f.file); else figs.selected.delete(f.file);
+      // The same file may be shown in more than one card.
+      body.querySelectorAll(".fig-card").forEach((c) => {
+        const g = set.figures[+c.dataset.idx];
+        if (g.file !== f.file) return;
+        c.classList.toggle("selected", ev.target.checked);
+        const box = c.querySelector("input[type=checkbox]");
+        if (box) box.checked = ev.target.checked;
+      });
+      renderFigureToolbar();
+    });
+    const cap = card.querySelector(".fig-caption:not(.empty)");
+    if (cap) cap.onclick = () => cap.classList.toggle("expanded");
+    card.querySelector('[data-act="open"]')?.addEventListener("click", () => openPath(f.path).catch((err) => toast(String(err))));
+    card.querySelector('[data-act="save"]')?.addEventListener("click", () => saveFigures([f.file]));
+    card.querySelector('[data-act="copy"]')?.addEventListener("click", () => {
+      navigator.clipboard.writeText(`${figLabel(f)}: ${f.caption}`);
+      toast("Caption copied");
+    });
+  });
+  if (/\$/.test(set.figures.map((f) => f.caption).join(""))) {
+    ensureKatex().then((ok) => {
+      if (!ok || !window.renderMathInElement || !body.isConnected) return;
+      body.querySelectorAll(".fig-caption:not(.empty)").forEach((el) => window.renderMathInElement(el, {
+        delimiters: [{ left: "$", right: "$", display: false }],
+        throwOnError: false,
+      }));
+    });
+  }
+}
+
+async function loadFigureThumb(el, f, token) {
+  const note = (text) => { el.innerHTML = `<span class="fig-thumb-note">${text}</span>`; };
+  if (f.kind === "eps" || f.kind === "ps") return note(`${f.kind.toUpperCase()} can't be previewed here.<br>Click to open it.`);
+  if (f.bytes > FIG_PREVIEW_MAX) return note("Large file — click to open it.");
+  try {
+    const buf = await invoke("read_figure", { path: f.path });
+    if (token !== figs.token) return;
+    if (f.kind === "pdf") {
+      const lib = await ensurePdfjs();
+      const doc = await lib.getDocument({ data: new Uint8Array(buf) }).promise;
+      try {
+        const page = await doc.getPage(1);
+        const base = page.getViewport({ scale: 1 });
+        const scale = Math.min(4, Math.max(0.5, (el.clientWidth * (window.devicePixelRatio || 1)) / base.width));
+        const vp = page.getViewport({ scale });
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.ceil(vp.width);
+        canvas.height = Math.ceil(vp.height);
+        await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+        if (token === figs.token) el.replaceChildren(canvas);
+      } finally {
+        doc.destroy();
+      }
+    } else {
+      const url = URL.createObjectURL(new Blob([buf], { type: FIG_MIME[f.kind] || "application/octet-stream" }));
+      figs.urls.push(url);
+      const img = new Image();
+      img.alt = figLabel(f);
+      img.onerror = () => note("No preview — click to open it.");
+      img.src = url;
+      el.replaceChildren(img);
+    }
+  } catch {
+    if (token === figs.token) note("No preview — click to open it.");
+  }
+}
+
+async function saveFigures(files) {
+  if (!figs.set) return;
+  try {
+    const [dir, n] = await invoke("save_figures_to_downloads", { arxivId: figs.set.arxiv_id, files });
+    toast(`Saved ${n} file${n === 1 ? "" : "s"} to Downloads`, { label: "Show folder", run: () => openPath(dir) });
+  } catch (err) {
+    toast("Could not save: " + err);
+  }
+}
+
+$("#figures-close").onclick = closeFigures;
+$("#figures-overlay").addEventListener("click", (e) => { if (e.target.id === "figures-overlay") closeFigures(); });
+$("#fig-save-all").onclick = () => saveFigures(null);
+$("#fig-save-selected").onclick = () => saveFigures([...figs.selected]);
+$("#fig-open-folder").onclick = () => figs.set && openPath(figs.set.dir).catch((err) => toast(String(err)));
+$("#fig-keep").onclick = async () => {
+  const set = figs.set, p = figs.paper, token = figs.token;
+  if (!set || !p) return;
+  const btn = $("#fig-keep");
+  btn.disabled = true;
+  try {
+    if (set.in_library) {
+      await invoke("remove_kept_figures", { arxivId: set.arxiv_id });
+      figs.set = await invoke("cached_figures", { arxivId: set.arxiv_id });
+      toast("Removed figures from the library");
+    } else {
+      const wasSaved = isSaved(p.arxiv_id);
+      figs.set = await invoke("keep_figures", { paper: p });
+      toast(wasSaved ? "Figures kept in library" : "Paper saved and figures kept in library");
+      if (!wasSaved) {
+        await loadLibrary();
+        if (state.selectedPaper?.arxiv_id === p.arxiv_id) selectPaper(state.papers.find((x) => x.arxiv_id === p.arxiv_id) || p);
+      }
+    }
+  } catch (err) {
+    toast(String(err));
+  }
+  if (token !== figs.token) return;
+  // Files moved, so previews need their new paths.
+  if (figs.set) renderFigures(); else closeFigures();
+};
 
 // ---------- Detail pane ----------
 // Build the right-panel collection control: colored "Added to X" chips for each
@@ -2582,6 +2858,7 @@ function selectPaper(p) {
       ${hasLocal ? `<button id="del-pdf">Delete PDF</button>` : ""}
       ${hasLocal ? "" : `<button id="open-preview" title="Open without saving to your library">${IS_MAC ? "Open in Preview" : "Open in PDF viewer"}</button>`}
       <button id="save-downloads">Save to Downloads</button>
+      <button id="show-figures" title="Get the figures from the paper's LaTeX source on arXiv">Figures</button>
       <button id="cite-paper" title="Resolve published DOI and add to Bibliography">Cite ▾</button>
       ${isTrashed(p.arxiv_id)
         ? `<button class="primary" id="restore-lib">Restore from trash</button>`
@@ -2754,6 +3031,10 @@ function selectPaper(p) {
       ev.target.textContent = original; ev.target.disabled = false;
     }
   });
+  $("#show-figures").addEventListener("click", () => openFigures(p));
+  invoke("cached_figures", { arxivId: p.arxiv_id })
+    .then((set) => { if (set && state.selectedPaper?.arxiv_id === p.arxiv_id) refreshFiguresButton(p.arxiv_id, set); })
+    .catch(() => {});
   $("#cite-paper")?.addEventListener("click", (ev) => {
     ev.stopPropagation();
     showContextMenu(ev.clientX, ev.clientY, [
@@ -4593,6 +4874,7 @@ document.addEventListener("keydown", (e) => {
       ["#category-modal", () => $("#category-modal").classList.add("hidden")],
       ["#edge-modal", () => $("#edge-cancel").click()],
       ["#color-modal", () => $("#color-cancel").click()],
+      ["#figures-overlay", () => closeFigures()],
     ];
     for (const [sel, close] of dialogs) {
       if (!$(sel).classList.contains("hidden")) { e.preventDefault(); close(); return; }
@@ -4653,7 +4935,7 @@ document.addEventListener("keydown", (e) => {
   if (typing) return;
   // Single-key shortcuts must not fire behind an open dialog.
   const anyDialog = ["#modal", "#saved-search-modal", "#category-modal", "#edge-modal", "#color-modal",
-    "#settings-overlay", "#name-modal", "#onboarding-overlay", "#quick-search-overlay"]
+    "#settings-overlay", "#name-modal", "#onboarding-overlay", "#quick-search-overlay", "#figures-overlay"]
     .some((sel) => !$(sel).classList.contains("hidden"));
   if (anyDialog && e.key !== "Escape") return;
   const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
@@ -4762,12 +5044,10 @@ let fontScale = 100;
 let fontFamily = "system";
 
 function applyAppearance() {
-  document.documentElement.style.setProperty("--font-scale", (fontScale / 100).toString());
   document.documentElement.setAttribute("data-font", fontFamily);
-  // Only apply the scaling transform when actually zoomed, so the default 100%
-  // view renders pixel-perfect crisp (no compositing-layer softening).
-  const app = document.getElementById("app");
-  if (app) app.classList.toggle("zoomed", fontScale !== 100);
+  // Native webview zoom scales everything (dialogs, menus, toasts, overlays)
+  // and keeps text crisp; CSS zoom on #app left everything outside it unscaled.
+  invoke("set_ui_zoom", { scale: fontScale / 100 }).catch(() => {});
   const valEl = document.getElementById("font-scale-value");
   if (valEl) valEl.textContent = fontScale + "%";
   const sel = document.getElementById("font-family-select");
@@ -4890,6 +5170,10 @@ async function openSettings() {
     const used = await invoke("pdf_storage_used");
     $("#pdf-storage").textContent = fmtBytes(used);
   } catch { $("#pdf-storage").textContent = "—"; }
+
+  invoke("figures_storage_used")
+    .then((b) => { $("#fig-storage").textContent = fmtBytes(b); })
+    .catch(() => { $("#fig-storage").textContent = "—"; });
 
   // Collection dropdown for per-collection PDF deletion
   const sel = $("#pdf-del-collection");
@@ -5121,6 +5405,16 @@ $("#del-all-pdfs").onclick = async () => {
   await loadLibrary();
   $("#pdf-storage").textContent = fmtBytes(0);
   toast(`Deleted ${n} PDF${n === 1 ? "" : "s"}`);
+};
+
+$("#del-all-figures").onclick = async () => {
+  const ok = await window.__TAURI__.dialog.confirm(
+    "Delete all figures kept in the library? Your papers stay, and you can fetch the figures again anytime.",
+    { title: "Delete kept figures", kind: "warning" });
+  if (!ok) return;
+  const n = await invoke("delete_all_figures");
+  $("#fig-storage").textContent = fmtBytes(0);
+  toast(`Deleted figures of ${n} paper${n === 1 ? "" : "s"}`);
 };
 
 // Usage timer: count active time, flush every 30s and on blur/unload.

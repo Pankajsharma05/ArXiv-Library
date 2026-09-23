@@ -442,6 +442,29 @@
     </div>
   </div>
 
+  <!-- Source figures -->
+  <div id="figures-overlay" class="hidden">
+    <div class="figures-panel" role="dialog" aria-labelledby="figures-heading">
+      <div class="figures-head">
+        <div class="figures-title-wrap">
+          <h2 id="figures-heading">Figures</h2>
+          <div id="figures-paper" class="figures-paper"></div>
+        </div>
+        <button id="figures-close" class="mini-btn" title="Close (Esc)">✕</button>
+      </div>
+      <div class="figures-toolbar">
+        <span id="figures-status" class="figures-status"></span>
+        <span class="figures-actions">
+          <button id="fig-save-selected" class="btn-secondary">Save selected</button>
+          <button id="fig-save-all" class="btn-secondary">Save all to Downloads</button>
+          <button id="fig-keep" class="btn-secondary">Keep in library</button>
+          <button id="fig-open-folder" class="btn-secondary">Show folder</button>
+        </span>
+      </div>
+      <div id="figures-body" class="figures-body"></div>
+    </div>
+  </div>
+
   <!-- Settings overlay -->
   <div id="settings-overlay" class="hidden">
     <div class="settings-panel">
@@ -479,6 +502,17 @@
           <button id="del-all-pdfs" class="btn-secondary danger-btn">Delete ALL downloaded PDFs</button>
         </div>
         <p class="settings-hint">This removes PDF files only — your library entries, notes, and collections stay. You can re-download anytime. (To delete a single paper's PDF, use the Read/Download area or right-click a paper.)</p>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-label">Kept figures</div>
+        <div class="settings-row">
+          <span class="settings-value">Storage used</span><span id="fig-storage">—</span>
+        </div>
+        <div class="settings-actions">
+          <button id="del-all-figures" class="btn-secondary danger-btn">Delete all kept figures</button>
+        </div>
+        <p class="settings-hint">Figures you choose to keep from a paper's source are stored in the library. Figures you only view are temporary and cleared automatically after a week.</p>
       </div>
 
       <div class="settings-section">

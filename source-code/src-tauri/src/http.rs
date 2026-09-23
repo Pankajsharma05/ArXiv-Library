@@ -2,7 +2,7 @@ use once_cell::sync::Lazy;
 use std::time::Duration;
 
 pub const USER_AGENT: &str =
-    "ArxivLibrary/1.1 (+https://github.com/Pankajsharma05/ArXiv-Library; personal research tool)";
+    "ArxivLibrary/1.2 (+https://github.com/Pankajsharma05/ArXiv-Library; personal research tool)";
 
 /// One connection-pooled client for all API calls. Building a fresh
 /// `reqwest::Client` per request throws away keep-alive connections and TLS

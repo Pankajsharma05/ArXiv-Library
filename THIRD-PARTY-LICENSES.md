@@ -35,6 +35,7 @@ All are dual MIT/Apache-2.0 or MIT licensed:
 - chrono — MIT/Apache-2.0
 - dirs — MIT/Apache-2.0
 - once_cell — MIT/Apache-2.0
+- flate2, tar — MIT/Apache-2.0
 
 To regenerate a complete, exact dependency license report, run:
 
@@ -50,5 +51,6 @@ or endorsed by any of them; please respect their terms of use:
 - **Semantic Scholar API** — https://www.semanticscholar.org/product/api
 - **Crossref API** — https://www.crossref.org/documentation/retrieve-metadata/rest-api/
 
-Paper metadata and abstracts retrieved via these APIs remain the property of
-their respective authors and publishers.
+Paper metadata and abstracts retrieved via these APIs, and figures extracted
+from arXiv source files, remain the property of their respective authors and
+publishers.

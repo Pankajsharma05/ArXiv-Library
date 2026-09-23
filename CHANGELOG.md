@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.0
+
+### New
+- **Source figures.** A new **Figures** button in the paper view (also in the
+  right-click menu) downloads the paper's LaTeX source from arXiv and shows every
+  figure as a thumbnail, numbered and captioned the way the paper prints them
+  (Fig. 2a, 2b… for multi-panel figures). Images the text doesn't place in a
+  figure are listed separately.
+  - **Save to Downloads**: all figures or only the selected ones go to
+    `~/Downloads/<arXiv id>_figures/`, with file names prefixed `Fig03a_…`.
+  - **Keep in library**: stores the figures next to your PDFs for offline use.
+    Settings shows the space they use and can delete them. Figures you only
+    view stay in a temp folder that is cleared after a week.
+  - PDF, PNG, JPG and SVG figures get previews. EPS/PS figures save and open
+    normally but have no preview. Figures drawn in LaTeX (TikZ, code listings)
+    are listed with their captions but have no image file.
+  - Papers submitted to arXiv as a PDF only have no source, and the panel says so.
+
+### Fixes
+- **Ctrl +/- (and Settings → font size) now scales the whole app.** Dialogs,
+  Settings, the Figures panel, right-click menus and toasts used to stay at 100%
+  while only the main layout zoomed. The app now uses the webview's native zoom,
+  so everything scales together and text stays sharp. The saved zoom is applied
+  before the window first paints.
+- When zoomed in on a smaller window, the sidebar and paper list narrow a little
+  instead of squeezing the abstract pane to a sliver. Dragging a divider starts
+  from the width you see.
+
 ## 1.1.0
 
 ### Fixes

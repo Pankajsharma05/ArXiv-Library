@@ -5,6 +5,7 @@ mod arxiv;
 mod crossref;
 mod db;
 mod downloader;
+mod figures;
 mod http;
 mod semantic;
 mod settings;
@@ -127,6 +128,7 @@ fn bulk_tag(state: State<AppState>, ids: Vec<String>, tag_id: String) -> Result<
 fn bulk_delete_papers(state: State<AppState>, ids: Vec<String>) -> Result<u32, String> {
     let paths = state.db.bulk_delete_papers(&ids)?;
     for p in &paths { downloader::delete(p); }
+    prune_figures(&state);
     Ok(ids.len() as u32)
 }
 
@@ -135,6 +137,7 @@ fn delete_paper(state: State<AppState>, id: String) -> Result<(), String> {
     if let Some(path) = state.db.delete_paper(&id)? {
         downloader::delete(&path);
     }
+    prune_figures(&state);
     Ok(())
 }
 
@@ -486,6 +489,64 @@ fn delete_all_pdfs(state: State<AppState>) -> Result<u32, String> {
     Ok(count)
 }
 
+// ---- Source figures ----
+
+/// Drops kept figures of papers that were permanently deleted.
+fn prune_figures(state: &AppState) {
+    if let Ok(papers) = state.db.all_papers() {
+        let ids: Vec<String> = papers.into_iter().map(|p| p.arxiv_id).collect();
+        figures::prune(&ids);
+    }
+}
+
+/// Figures already fetched for a paper, without touching the network.
+#[tauri::command]
+fn cached_figures(arxiv_id: String) -> Option<figures::FigureSet> {
+    figures::cached(&arxiv_id)
+}
+
+/// Downloads the paper's LaTeX source and extracts its figures (cached).
+#[tauri::command]
+async fn fetch_figures(app: tauri::AppHandle, arxiv_id: String) -> Result<figures::FigureSet, String> {
+    figures::fetch(&arxiv_id, Some(&app)).await
+}
+
+/// Raw bytes of a figure for previews, sent without JSON encoding.
+#[tauri::command]
+fn read_figure(path: String) -> Result<tauri::ipc::Response, String> {
+    figures::read(&path).map(tauri::ipc::Response::new)
+}
+
+/// Copies figures (all, or the named files) into ~/Downloads/<id>_figures/.
+#[tauri::command]
+fn save_figures_to_downloads(arxiv_id: String, files: Option<Vec<String>>) -> Result<(String, u32), String> {
+    figures::save_to_downloads(&arxiv_id, files)
+}
+
+/// Keeps a paper's figures in the library, saving the paper if needed.
+#[tauri::command]
+fn keep_figures(state: State<AppState>, paper: Paper) -> Result<figures::FigureSet, String> {
+    if !state.db.all_papers()?.iter().any(|p| p.arxiv_id == paper.arxiv_id) {
+        state.db.save_paper(&paper)?;
+    }
+    figures::keep_in_library(&paper.arxiv_id)
+}
+
+#[tauri::command]
+fn remove_kept_figures(arxiv_id: String) -> Result<(), String> {
+    figures::remove_from_library(&arxiv_id)
+}
+
+#[tauri::command]
+fn figures_storage_used() -> u64 {
+    figures::storage_used()
+}
+
+#[tauri::command]
+fn delete_all_figures() -> u32 {
+    figures::delete_all()
+}
+
 // ---- Tags ----
 
 #[tauri::command]
@@ -535,6 +596,7 @@ fn empty_trash(state: State<AppState>) -> Result<u32, String> {
     let paths = state.db.empty_trash()?;
     let n = paths.len() as u32;
     for p in paths { downloader::delete(&p); }
+    prune_figures(&state);
     Ok(n)
 }
 
@@ -567,6 +629,13 @@ fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("Could not read file: {e}"))
 }
 
+/// Zooms the whole page natively, like a browser's Ctrl +/-, so dialogs, menus
+/// and toasts scale together with the main layout.
+#[tauri::command]
+fn set_ui_zoom(webview: tauri::Webview, scale: f64) -> Result<(), String> {
+    webview.set_zoom(scale.clamp(0.7, 1.6)).map_err(|e| format!("Could not zoom: {e}"))
+}
+
 /// Open a file path in the system default app from Rust (bypasses frontend path scope).
 #[tauri::command]
 fn open_in_default_app(app: tauri::AppHandle, path: String) -> Result<(), String> {
@@ -580,11 +649,22 @@ fn open_in_default_app(app: tauri::AppHandle, path: String) -> Result<(), String
 pub fn run() {
     let db = Db::open().expect("failed to open database");
     let settings = SettingsStore::load();
+    let zoom = settings.get().font_scale;
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState { db, settings })
+        .setup(move |app| {
+            // Apply the saved zoom before the page paints, avoiding a jump at startup.
+            use tauri::Manager;
+            if zoom != 100 {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.set_zoom(zoom as f64 / 100.0);
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             search_arxiv,
             lookup_arxiv_ids,
@@ -651,6 +731,14 @@ pub fn run() {
             delete_pdf,
             delete_pdfs_in_collection,
             delete_all_pdfs,
+            cached_figures,
+            fetch_figures,
+            read_figure,
+            save_figures_to_downloads,
+            keep_figures,
+            remove_kept_figures,
+            figures_storage_used,
+            delete_all_figures,
             add_tag,
             delete_tag,
             set_tag_color,
@@ -664,6 +752,7 @@ pub fn run() {
             import_backup,
             read_text_file,
             open_in_default_app,
+            set_ui_zoom,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
